@@ -1,0 +1,16 @@
+[project]
+name = "evsmem"
+version = "0.1.0"
+description = "SQLite-based Honcho-compatible memory service — zero infra"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi[standard]>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "requests>=2.31.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.5.0",
+    "llama-cpp-python>=0.3.0",
+]
+
+[project.scripts]
+evsmem = "evsmem.__main__:main"
