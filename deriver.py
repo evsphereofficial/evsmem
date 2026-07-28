@@ -1,936 +1,386 @@
 """
-evsmem Deriver — background session sync.
+evsmem/deriver.py — Pure ingestion watcher.
 
-Reads new messages from ev-agent sessions and syncs them
-into the evsmem database for memory storage.
-
-Usage:
-  from deriver import Deriver
-  d = Deriver()
-  d.run_once()          # process all new messages
-  d.run_forever()       # poll every N seconds
+Monitors the ev-agent SQLite database for new conversation messages,
+appends them to the evsmem raw conversation queue, and maintains a cursor.
+No interpretation, summarization, or classification is performed.
 """
 
-import hashlib
 import json
 import logging
-import os
-import re
 import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Any, Optional
-from uuid import uuid4
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
-
-# Ev-agent session DB path
-EV_SESSION_DB = Path.home() / ".local" / "share" / "ev-agent" / "ev-agent-local.db"
-
-POLL_INTERVAL = float(os.getenv("DERIVER_POLL_INTERVAL", "30.0"))
-MAX_FACTS_PER_BATCH = int(os.getenv("DERIVER_MAX_FACTS", "10"))
-
-
-# ── LLM Analysis Prompt ──
-
-LLM_ANALYSIS_PROMPT = """\
-Analyze this message from a conversation between a user and an AI coding assistant.
-
-Message: "{content}"
-
-Output a JSON object with these fields (only include relevant ones):
-{{
-  "user_name": "extracted name or null",
-  "user_mood": "detected mood or null",
-  "user_preferences": ["preference1", "preference2"],
-  "memories": [{{"content": "something to remember", "importance": 0.5}}],
-  "conclusions": ["insight about user or project"],
-  "agent_assessment": {{"agent_name": "...", "verdict": "positive|negative|neutral", "detail": "..."}}
-}}
-
-Return ONLY valid JSON, no other text."""
-
-
-def get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS deriver_state (
-               key TEXT PRIMARY KEY,
-               value TEXT NOT NULL,
-               updated_at TEXT NOT NULL
-           )"""
-    )
-    return conn
+from evsmem.config import (
+    EVAGENT_DB_PATH,
+    EVSMEM_DB_PATH,
+    DERIVER_POLL_INTERVAL,
+)
 
 
 class Deriver:
-    """Background fact extractor for evsmem."""
+    """
+    Lightweight ingestion-only component.
 
-    def __init__(self):
-        self._last_processed_rowid: Optional[int] = None
+    Watches the ev-agent database for new messages and feeds
+    them into the evsmem memory system's raw conversation queue
+    (the ``raw_conversations`` table). A high-water cursor is
+    persisted in ``cursor_state`` to ensure exactly-once delivery.
+    """
+
+    def __init__(
+        self,
+        evagent_db_path: str | Path | None = None,
+        evsmem_db_path: str | Path | None = None,
+        poll_interval: float | None = None,
+    ) -> None:
+        self.evagent_db_path = Path(evagent_db_path) if evagent_db_path else Path(EVAGENT_DB_PATH)
+        self.evsmem_db_path = Path(evsmem_db_path) if evsmem_db_path else Path(EVSMEM_DB_PATH)
+        self.poll_interval = poll_interval if poll_interval is not None else DERIVER_POLL_INTERVAL
         self._running = False
+        self._evsmem_store: Optional["MemoryStore"] = None  # lazy import
 
-    # ── Cursor-based message tracking ──
+    # ── evsmem store access ─────────────────────────────────────────────
 
-    def _get_unprocessed_messages(self) -> list[dict]:
-        """Get unprocessed messages — one at a time, no role filter.
+    def _get_store(self) -> "MemoryStore":
+        """Lazy-load MemoryStore to avoid circular imports at module level."""
+        if self._evsmem_store is None:
+            from evsmem.memory_store import MemoryStore  # type: ignore[import-untyped]
 
-        Uses cursor-based tracking via deriver_state key 'last_processed_rowid'
-        to avoid reprocessing after restarts.
+            self._evsmem_store = MemoryStore(self.evsmem_db_path)
+        return self._evsmem_store
+
+    # ── Cursor management ───────────────────────────────────────────────
+
+    def get_cursor(self) -> int:
+        """Return the last-processed ev-agent message rowid (0 if none)."""
+        return self._get_store().get_cursor()
+
+    def update_cursor(self, message_rowid: int) -> None:
+        """Persist the high-water mark."""
+        self._get_store().update_cursor(message_rowid)
+
+    # ── Ev-agent DB access ──────────────────────────────────────────────
+
+    def _connect_evagent(self) -> sqlite3.Connection:
+        """Open a read-only connection to the ev-agent SQLite database."""
+        conn = sqlite3.connect(f"file:{self.evagent_db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # ── Message detection ───────────────────────────────────────────────
+
+    def check_for_new_messages(self) -> list[dict]:
         """
-        conn = get_db()
+        Query the ev-agent DB for messages newer than the current cursor.
+
+        Handles the Honcho-style schema used by ev-agent (``message`` table
+        with a JSON ``data`` column, plus a ``part`` table for text content).
+        Falls back to simple table discovery for other schemas.
+
+        Returns a list of dicts with keys::
+
+            rowid         — raw rowid from ev-agent DB
+            session_id    — conversation / session identifier
+            role          — 'user' or 'assistant'
+            content       — plain-text body of the message
+        """
+        cursor_rowid = self.get_cursor()
+
+        if not self.evagent_db_path.exists():
+            logger.debug("ev-agent DB not found at %s", self.evagent_db_path)
+            return []
+
         try:
-            # Initialize cursor from persistent state
-            if self._last_processed_rowid is None:
-                state = conn.execute(
-                    "SELECT value FROM deriver_state WHERE key='last_processed_rowid'"
-                ).fetchone()
-                if state:
-                    self._last_processed_rowid = int(state["value"])
-                else:
-                    row = conn.execute("SELECT MAX(rowid) FROM messages").fetchone()
-                    self._last_processed_rowid = row[0] if row and row[0] is not None else 0
-                    conn.execute(
-                        """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                           VALUES ('last_processed_rowid', ?, ?)""",
-                        (str(self._last_processed_rowid), datetime.now(timezone.utc).isoformat()),
+            conn = self._connect_evagent()
+        except sqlite3.Error as exc:
+            logger.warning("Cannot open ev-agent DB: %s", exc)
+            return []
+
+        try:
+            # ── Probe the available tables ──
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+            messages: list[dict] = []
+
+            # ── Strategy A: Honcho-style schema (message + part) ──
+            if "message" in tables and "part" in tables:
+                rows = conn.execute(
+                    """
+                    SELECT m.rowid,
+                           m.id          AS message_id,
+                           m.session_id,
+                           m.data        AS message_data,
+                           m.time_created
+                    FROM message m
+                    WHERE m.rowid > ?
+                    ORDER BY m.rowid ASC
+                    """,
+                    (cursor_rowid,),
+                ).fetchall()
+
+                for row in rows:
+                    # Parse the JSON data blob
+                    try:
+                        data = (
+                            json.loads(row["message_data"])
+                            if isinstance(row["message_data"], str)
+                            else (row["message_data"] or {})
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        data = {}
+
+                    role = data.get("role", "unknown")
+
+                    # Retrieve text parts from the part table
+                    content = self._extract_text_from_parts(conn, row["message_id"])
+
+                    messages.append(
+                        {
+                            "rowid": row["rowid"],
+                            "session_id": row["session_id"],
+                            "role": role,
+                            "content": content,
+                        }
                     )
-                    conn.commit()
 
-            rows = conn.execute(
-                """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
-                          s.workspace_id
-                   FROM messages m
-                   JOIN sessions s ON m.session_id = s.id
-                   WHERE m.rowid > ? AND m.role = 'user' AND m.content != ''
-                     AND m.content NOT LIKE '[auto:%'
-                   ORDER BY m.rowid ASC""",
-                (self._last_processed_rowid,),
-            ).fetchall()
-
-            return [
-                {
-                    "rowid": r["rowid"],
-                    "id": r["id"],
-                    "content": r["content"],
-                    "role": r["role"],
-                    "session_id": r["session_id"],
-                    "workspace_id": r["workspace_id"],
+            # ── Strategy B: Simple 'messages' table ──
+            elif "messages" in tables:
+                cols = {
+                    col[1]
+                    for col in conn.execute(
+                        "PRAGMA table_info(messages)"
+                    ).fetchall()
                 }
-                for r in rows
-            ]
+                if "rowid" in cols:
+                    id_col = "rowid"
+                elif "id" in cols:
+                    id_col = "id"
+                else:
+                    id_col = "rowid"
+
+                select_cols = [id_col, "session_id", "role", "content"]
+                select_list = ", ".join(
+                    f"m.{c}" if c != id_col else f"m.{id_col} AS rowid"
+                    for c in select_cols
+                )
+
+                try:
+                    rows = conn.execute(
+                        f"SELECT {select_list} FROM messages m "
+                        f"WHERE m.{id_col} > ? ORDER BY m.{id_col} ASC",
+                        (cursor_rowid,),
+                    ).fetchall()
+                    for r in rows:
+                        messages.append(dict(r))
+                except sqlite3.OperationalError:
+                    pass
+
+            # ── Strategy C: 'conversations' table ──
+            elif "conversations" in tables:
+                cols = {
+                    col[1]
+                    for col in conn.execute(
+                        "PRAGMA table_info(conversations)"
+                    ).fetchall()
+                }
+                if "id" in cols and "content" in cols:
+                    id_col = "rowid"
+                    # Always select rowid (implicit in SQLite, not in PRAGMA)
+                    select_cols = ["c.rowid AS rowid"]
+                    for col_name in ("content", "role"):
+                        if col_name in cols:
+                            select_cols.append(f"c.{col_name}")
+                    select_list = ", ".join(select_cols)
+                    if not select_list:
+                        select_list = "rowid, content"
+                    try:
+                        rows = conn.execute(
+                            f"SELECT {select_list} FROM conversations c "
+                            f"WHERE c.rowid > ? ORDER BY c.rowid ASC",
+                            (cursor_rowid,),
+                        ).fetchall()
+                        for r in rows:
+                            d = dict(r)
+                            d.setdefault("role", "user")
+                            d.setdefault("session_id", "default")
+                            messages.append(d)
+                    except sqlite3.OperationalError:
+                        pass
+
+            return messages
+
+        except sqlite3.Error as exc:
+            logger.warning("Error querying ev-agent DB: %s", exc)
+            return []
         finally:
             conn.close()
 
-    def _advance_message_cursor(self, rowid: int):
-        """Advance the LLM processing cursor (last_processed_rowid).
-
-        Separate from the sync cursor (last_synced_rowid) managed in
-        _sync_ev_sessions.
-        """
-        conn = get_db()
+    @staticmethod
+    def _extract_text_from_parts(
+        conn: sqlite3.Connection, message_id: str
+    ) -> str:
+        """Assemble plain text from the ``part`` table for a given message."""
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                   VALUES ('last_processed_rowid', ?, ?)""",
-                (str(rowid), datetime.now(timezone.utc).isoformat()),
-            )
-            conn.commit()
-            self._last_processed_rowid = rowid
-        finally:
-            conn.close()
+            part_rows = conn.execute(
+                "SELECT data FROM part WHERE message_id=? ORDER BY time_created ASC",
+                (message_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return ""
 
-    # ── LLM Processing Pipeline ──
+        text_parts: list[str] = []
+        for p in part_rows:
+            try:
+                pd = (
+                    json.loads(p["data"])
+                    if isinstance(p["data"], str)
+                    else (p["data"] or {})
+                )
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if pd.get("type") in ("text", "reasoning"):
+                text = (pd.get("text") or "").strip()
+                if text:
+                    text_parts.append(text[:4000])
+        return " | ".join(text_parts[:10]) if text_parts else ""
 
-    def _process_new_messages_with_llm(self) -> int:
-        """Process unprocessed messages through local LLM to extract facts.
+    # ── Ingestion pipeline ──────────────────────────────────────────────
 
-        Returns the number of messages successfully processed.
+    def ingest(self, messages: list[dict]) -> int:
         """
-        from llm_client import LLMClient
+        Append raw messages to the evsmem raw queue and create batches.
 
-        llm = LLMClient()
-        if not llm.is_available():
-            logger.debug("LLM not available, skipping message processing")
-            return 0
+        Args:
+            messages: List of message dicts from :meth:`check_for_new_messages`.
 
-        messages = self._get_unprocessed_messages()
+        Returns:
+            Number of messages ingested.
+        """
         if not messages:
             return 0
 
-        processed = 0
-        skipped = 0
-        processed_sessions = set()
+        store = self._get_store()
+        batch_message_ids: list[int] = []
+        last_conversation_id: str | None = None
+        ingested = 0
+
         for msg in messages:
-            sid = msg.get("session_id")
             rowid = msg["rowid"]
-            try:
-                if sid and sid in processed_sessions:
-                    self._advance_message_cursor(rowid)
-                    skipped += 1
-                    continue
-                parsed = self._analyze_message_with_llm(llm, msg)
-                if parsed:
-                    self._store_llm_results(parsed, msg)
-                    if sid:
-                        processed_sessions.add(sid)
-                    processed += 1
-                self._advance_message_cursor(rowid)
-            except Exception as e:
-                logger.warning(f"LLM processing error for msg {rowid}: {e}")
-                self._advance_message_cursor(rowid)
+            conversation_id = msg.get("session_id", "default")
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
 
-        if processed > 0 or skipped > 0:
-            logger.info(f"Deriver: processed {processed} sessions, skipped {skipped} dup msgs")
-        return processed
-
-    def _analyze_message_with_llm(self, llm, msg: dict) -> Optional[dict]:
-        """Build prompt, call LLM, and parse the JSON response.
-
-        Args:
-            llm: An LLMClient instance.
-            msg: Message dict with 'content', 'role', etc.
-
-        Returns:
-            Parsed JSON dict, or None on failure.
-        """
-        content = (msg.get("content") or "").strip()
-        if not content:
-            return None
-
-        if content.startswith("[auto:"):
-            idx = content.find("] ", 6)
-            if idx != -1:
-                content = content[idx+2:].strip()
-
-        if len(content) < 10:
-            return None
-
-        prompt = LLM_ANALYSIS_PROMPT.format(content=content[:2000])
-
-        raw = llm.generate(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
-            temperature=0.1,
-        )
-
-        if not raw:
-            logger.debug(f"LLM returned empty for message {msg.get('rowid')}")
-            return None
-
-        return self._parse_llm_output(raw)
-
-    def _parse_llm_output(self, raw: str) -> Optional[dict]:
-        """Parse JSON from the LLM's raw text output.
-
-        Handles markdown code fences and stray text before/after JSON.
-        """
-        text = raw.strip()
-
-        # Remove markdown code fences if present
-        if text.startswith("```"):
-            # Find the first { or [ after the opening fence
-            start = text.find("{")
-            if start == -1:
-                start = text.find("[")
-            if start != -1:
-                text = text[start:]
-            # Remove trailing fence
-            end = text.rfind("}")
-            if end == -1:
-                end = text.rfind("]")
-            if end != -1:
-                text = text[: end + 1]
-
-        # Try to find JSON object boundaries
-        brace_start = text.find("{")
-        brace_end = text.rfind("}")
-        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-            text = text[brace_start : brace_end + 1]
-
-        try:
-            result = json.loads(text)
-            if isinstance(result, dict):
-                return result
-            logger.debug(f"LLM output was not a dict: {type(result)}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.debug(f"Failed to parse LLM JSON: {e}")
-            return None
-
-    def _store_llm_results(self, parsed: dict, msg: dict):
-        """Dispatch LLM results to the appropriate storage targets.
-
-        Populates conclusions, memories, peer metadata, and reputation.
-        """
-        session_id = msg.get("session_id")
-        workspace_id = msg.get("workspace_id")
-        if not session_id or not workspace_id:
-            return
-
-        self._store_llm_conclusions(parsed, session_id)
-        self._store_llm_memories(parsed, workspace_id, session_id)
-        self._update_peer_from_llm(parsed, workspace_id)
-        self._store_agent_assessment(parsed, workspace_id)
-
-    def _store_llm_conclusions(self, parsed: dict, session_id: str):
-        """Store derived facts/insights as conclusions via crud."""
-        conclusions = parsed.get("conclusions")
-        if not conclusions or not isinstance(conclusions, list):
-            return
-
-        from embeddings import EmbeddingClient
-
-        _ec = EmbeddingClient()
-        import crud as _crud
-
-        seen = set()
-        try:
-            conn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
-            seen = set(row[0] for row in conn.execute(
-                "SELECT content FROM conclusions WHERE session_id=?", (session_id,)
-            ).fetchall())
-            conn.close()
-        except Exception:
-            pass
-
-        for conc_text in conclusions:
-            if not conc_text or not isinstance(conc_text, str):
+            if not content:
+                # Still advance cursor for empty messages so we don't stall
+                self.update_cursor(rowid)
                 continue
-            conc_text = conc_text.strip()
-            if not conc_text or conc_text in seen:
-                continue
-            seen.add(conc_text)
-            try:
-                emb = None
-                if _ec.is_available():
-                    try:
-                        emb = _ec.embed(conc_text[:2000])
-                    except Exception:
-                        pass
 
-                _crud.create_conclusion(
-                    session_id=session_id,
-                    content=conc_text,
-                    metadata={
-                        "category": "derived_insight",
-                        "source": "deriver_llm",
-                        "extracted_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    embedding=emb,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to store conclusion: {e}")
+            # Insert into raw queue
+            msg_db_id = store.append_raw_message(
+                conversation_id=conversation_id,
+                role=role,
+                content=content,
+            )
+            ingested += 1
 
-    def _store_llm_memories(self, parsed: dict, workspace_id: str, session_id: str):
-        """Store long-term memory items with embeddings via crud."""
-        memories = parsed.get("memories")
-        if not memories or not isinstance(memories, list):
-            return
-
-        from embeddings import EmbeddingClient
-
-        _ec = EmbeddingClient()
-        import crud as _crud
-
-        for mem in memories:
-            content = mem.get("content") if isinstance(mem, dict) else None
-            if not content or not isinstance(content, str):
-                continue
-            importance = float(mem.get("importance", 0.5))
-            try:
-                emb = None
-                if _ec.is_available():
-                    try:
-                        emb = _ec.embed(content[:2000])
-                    except Exception:
-                        pass
-
-                _crud.create_memory(
-                    workspace_id=workspace_id,
-                    type="conversation_insight",
-                    content=content,
-                    importance=importance,
-                    confidence=0.8,
-                    source="deriver_llm",
-                    metadata={"session_id": session_id},
-                    embedding=emb,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to store memory: {e}")
-
-    def _update_peer_from_llm(self, parsed: dict, workspace_id: str):
-        """Update user peer metadata with extracted user info."""
-        import crud as _crud
-
-        # Check if we have any user info to update
-        user_name = parsed.get("user_name")
-        user_mood = parsed.get("user_mood")
-        user_preferences = parsed.get("user_preferences")
-        if not user_name and not user_mood and not user_preferences:
-            return
-
-        # Find or create the user peer for this workspace
-        try:
-            peer = _crud.get_or_create_peer(workspace_id, "user")
-            if not peer:
-                return
-
-            pid = peer["id"]
-            meta_update = {}
-
-            if user_name and isinstance(user_name, str):
-                meta_update["user_name"] = user_name
-
-            if user_mood and isinstance(user_mood, str):
-                meta_update["user_mood"] = user_mood.lower()
-                meta_update["mood_updated_at"] = datetime.now(timezone.utc).isoformat()
-
-            if user_preferences and isinstance(user_preferences, list):
-                meta_update["preferences"] = json.dumps(user_preferences)
-
-            if meta_update:
-                _crud.update_peer(pid, metadata=meta_update)
-        except Exception as e:
-            logger.debug(f"Failed to update peer metadata: {e}")
-
-    def _store_agent_assessment(self, parsed: dict, workspace_id: str):
-        """Store agent performance signals into reputation table."""
-        assessment = parsed.get("agent_assessment")
-        if not assessment or not isinstance(assessment, dict):
-            return
-
-        agent_name = assessment.get("agent_name")
-        verdict = assessment.get("verdict")
-        if not agent_name or not verdict:
-            return
-
-        import crud as _crud
-
-        try:
-            if verdict == "positive":
-                _crud.record_success(
-                    entity_type="agent",
-                    entity_name=agent_name,
-                    task_type="general",
-                )
-            elif verdict == "negative":
-                _crud.record_failure(
-                    entity_type="agent",
-                    entity_name=agent_name,
-                    task_type="general",
-                )
-            elif verdict == "neutral":
-                _crud.record_dispatch(
-                    entity_type="agent",
-                    entity_name=agent_name,
-                    task_type="general",
-                )
-        except Exception as e:
-            logger.debug(f"Failed to record agent assessment: {e}")
-
-    # ── DB operations (kept) ──
-
-    # ── Public API ──
-
-    def _sync_ev_sessions(self) -> int:
-        """Pull new messages from ev-agent session DB into evsmem.
-        Replaces the TypeScript auto-save hook that isn't working.
-        Uses deterministic hash-based IDs and cursor-based pagination
-        via deriver_state to prevent message duplication."""
-        if not EV_SESSION_DB.exists():
-            return 0
-
-        # Read sync cursor from deriver_state
-        last_rowid = 0
-        try:
-            state_conn = get_db()
-            row = state_conn.execute(
-                "SELECT value FROM deriver_state WHERE key='last_synced_rowid'"
-            ).fetchone()
-            if row:
-                last_rowid = int(row["value"])
-            state_conn.close()
-        except Exception:
-            last_rowid = 0
-
-        try:
-            src = sqlite3.connect(str(EV_SESSION_DB))
-            src.row_factory = sqlite3.Row
-
-            # Get messages newer than last sync cursor, ordered by rowid ASC
-            rows = src.execute("""
-                SELECT m.rowid, m.id, m.session_id, m.data, m.time_created,
-                       s.title AS session_title
-                FROM message m
-                JOIN session s ON m.session_id = s.id
-                WHERE m.rowid > ?
-                ORDER BY m.rowid ASC
-                LIMIT 50
-            """, (last_rowid,)).fetchall()
-
-            if not rows:
-                src.close()
-                return 0
-
-            # Phase 1: Parse messages and compute embeddings (BEFORE evsmem connection)
-            # This prevents DB lock contention — the embedding call is a slow network
-            # request that should not hold the evsmem DB connection open.
-            prepared = []
-            max_rowid = last_rowid
-            for row in rows:
-                max_rowid = max(max_rowid, row["rowid"])
-
-                try:
-                    data = json.loads(row["data"]) if isinstance(row["data"], str) else (row["data"] or {})
-                except (json.JSONDecodeError, TypeError):
-                    data = {}
-                role = data.get("role", "user")
-                content = ""
-
-                # Get text from parts
-                parts = src.execute(
-                    "SELECT data FROM part WHERE message_id=? ORDER BY time_created ASC",
-                    (row["id"],),
-                ).fetchall()
-                text_parts = []
-                for p in parts:
-                    try:
-                        pd = json.loads(p["data"]) if isinstance(p["data"], str) else (p["data"] or {})
-                    except (json.JSONDecodeError, TypeError):
-                        pd = {}
-                    if pd.get("type") in ("text", "reasoning"):
-                        text = (pd.get("text") or "").strip()
-                        if text and len(text) > 20:
-                            text_parts.append(text[:2000])
-                content = " | ".join(text_parts[:5]) if text_parts else str(data.get("summary", ""))[:500]
-                if not content:
-                    continue
-
-                # Embed from full content (BEFORE evsmem connection opens)
-                msg_emb = None
-                try:
-                    from embeddings import EmbeddingClient
-                    _ec = EmbeddingClient()
-                    if _ec.is_available():
-                        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-                        with ThreadPoolExecutor(max_workers=1) as pool:
-                            future = pool.submit(_ec.embed, content[:8000])
-                            msg_emb = future.result(timeout=15)
-                except FutureTimeout:
-                    logger.warning("Embedding timed out (15s) - skipping")
-                except Exception:
-                    pass
-                msg_emb_json = json.dumps(msg_emb) if msg_emb else None
-
-                # Deterministic message ID from canonical fields
-                time_created = row["time_created"]
-                hash_input = f"{row['session_id']}:{role}:{content}:{time_created}"
-                deterministic_id = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
-
-                prepared.append({
-                    "row": row,
-                    "role": role,
-                    "content": content,
-                    "msg_emb_json": msg_emb_json,
-                    "deterministic_id": deterministic_id,
-                })
-
-            src.close()
-
-            if not prepared:
-                # Persist cursor even when no messages were prepared
-                try:
-                    cursor_conn = get_db()
-                    cursor_conn.execute(
-                        """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                           VALUES ('last_synced_rowid', ?, ?)""",
-                        (str(max_rowid), datetime.now(timezone.utc).isoformat()),
+            # Group consecutive messages from the same conversation
+            if last_conversation_id is not None and conversation_id != last_conversation_id:
+                # Flush previous batch
+                if batch_message_ids:
+                    store.create_batch(last_conversation_id, batch_message_ids)
+                    logger.debug(
+                        "Created batch for conversation %s (%d messages)",
+                        last_conversation_id,
+                        len(batch_message_ids),
                     )
-                    cursor_conn.commit()
-                    cursor_conn.close()
-                except Exception:
-                    pass
-                return 0
+                batch_message_ids = []
 
-            # Phase 2: Write each message with its own evsmem connection.
-            # Each iteration opens a fresh connection, writes one message, commits,
-            # and closes — preventing DB lock contention with other processes.
-            synced_count = 0
-            for prep in prepared:
-                row = prep["row"]
-                role = prep["role"]
-                content = prep["content"]
-                msg_emb_json = prep["msg_emb_json"]
-                deterministic_id = prep["deterministic_id"]
+            batch_message_ids.append(msg_db_id)
+            last_conversation_id = conversation_id
 
-                hcon = get_db()
-                try:
-                    # Get evsmem workspace
-                    ws = hcon.execute(
-                        "SELECT id FROM workspaces WHERE name='ev-agent' ORDER BY created_at ASC LIMIT 1"
-                    ).fetchone()
-                    if not ws:
-                        continue
-                    wid = ws["id"]
+            # Advance cursor after every message
+            self.update_cursor(rowid)
 
-                    # Get or create a session for auto-saved messages
-                    evsmem_sid = None
-                    hs = hcon.execute(
-                        "SELECT id FROM sessions WHERE workspace_id=? AND name='auto-save'",
-                        (wid,),
-                    ).fetchone()
-                    if hs:
-                        evsmem_sid = hs["id"]
-                    else:
-                        hcon.execute(
-                            "INSERT INTO sessions (id, workspace_id, name, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (str(uuid4()), wid, "auto-save", "{}", datetime.now(timezone.utc).isoformat()),
-                        )
-                        hcon.commit()
-                        hs = hcon.execute(
-                            "SELECT id FROM sessions WHERE workspace_id=? AND name='auto-save'",
-                            (wid,),
-                        ).fetchone()
-                        if hs:
-                            evsmem_sid = hs["id"]
-
-                    if not evsmem_sid:
-                        continue
-
-                    # Get or create peers
-                    user_peer = hcon.execute(
-                        "SELECT id FROM peers WHERE workspace_id=? AND name='user'",
-                        (wid,),
-                    ).fetchone()
-                    if not user_peer:
-                        hcon.execute(
-                            "INSERT INTO peers (id, workspace_id, name, metadata) VALUES (?, ?, ?, ?)",
-                            (str(uuid4()), wid, "user", "{}"),
-                        )
-                        hcon.commit()
-                        user_peer = hcon.execute(
-                            "SELECT id FROM peers WHERE workspace_id=? AND name='user'",
-                            (wid,),
-                        ).fetchone()
-                    user_pid = user_peer["id"] if user_peer else None
-
-                    agent_peer = hcon.execute(
-                        "SELECT id FROM peers WHERE workspace_id=? AND name='agent'",
-                        (wid,),
-                    ).fetchone()
-                    if not agent_peer:
-                        hcon.execute(
-                            "INSERT INTO peers (id, workspace_id, name, metadata) VALUES (?, ?, ?, ?)",
-                            (str(uuid4()), wid, "agent", "{}"),
-                        )
-                        hcon.commit()
-                        agent_peer = hcon.execute(
-                            "SELECT id FROM peers WHERE workspace_id=? AND name='agent'",
-                            (wid,),
-                        ).fetchone()
-                    agent_pid = agent_peer["id"] if agent_peer else None
-
-                    peer_id = user_pid if role == "user" else agent_pid
-                    if not peer_id:
-                        continue
-
-                    hcon.execute(
-                        """INSERT OR IGNORE INTO messages
-                           (id, session_id, peer_id, content, role, message_type, metadata, embedding, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            deterministic_id,
-                            evsmem_sid,
-                            peer_id,
-                            f"[auto:{row['session_id'][:16]}] [{row['session_title'] or '?'}] {content[:12000]}",
-                            role,
-                            "message",
-                            json.dumps({"scope": "session", "type": "auto-save",
-                                        "ev_session_id": row["session_id"]}),
-                            msg_emb_json,
-                            datetime.fromtimestamp(row["time_created"] / 1000,
-                                                    tz=timezone.utc).isoformat() if row["time_created"] else datetime.now(timezone.utc).isoformat(),
-                        ),
-                    )
-                    hcon.commit()
-                    synced_count += 1
-                finally:
-                    hcon.close()
-
-            # Persist sync cursor to deriver_state
-            try:
-                cursor_conn = get_db()
-                cursor_conn.execute(
-                    """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                       VALUES ('last_synced_rowid', ?, ?)""",
-                    (str(max_rowid), datetime.now(timezone.utc).isoformat()),
-                )
-                cursor_conn.commit()
-                cursor_conn.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist sync cursor: {e}")
-
-            if synced_count > 0:
-                logger.info(f"Deriver: synced {synced_count} ev-agent messages to evsmem")
-            return synced_count
-        except Exception as e:
-            logger.warning(f"Deriver ev-session sync error: {e}")
-            return 0
-
-    def _analyze_session_reputation(self):
-        """Analyze sessions for reputation updates - corrections, doom loops, and dispatch counting."""
-        conn = get_db()
-        try:
-            # ── Dispatch counting ──
-            # Count dispatches from evsmem sessions (each ended session with an agent is a dispatch)
-            ended_sessions = conn.execute("""
-                SELECT p.name as agent_name, s.id, COUNT(m.id) as msg_count
-                FROM sessions s
-                JOIN messages m ON m.session_id = s.id
-                JOIN peers p ON m.peer_id = p.id
-                WHERE s.created_at > datetime('now', '-30 days') AND p.name != 'user'
-                GROUP BY s.id, p.name
-            """).fetchall()
-
-            for s in ended_sessions:
-                agent_name = s["agent_name"] or "unknown"
-                if not agent_name:
-                    continue
-
-                # Record dispatch
-                existing = conn.execute(
-                    "SELECT id, dispatch_count FROM reputation WHERE entity_type='agent' AND entity_name=? AND task_type=''",
-                    (agent_name,)
-                ).fetchone()
-
-                if existing:
-                    conn.execute(
-                        "UPDATE reputation SET dispatch_count = dispatch_count + 1, last_used_at = datetime('now') WHERE id=?",
-                        (existing["id"],)
-                    )
-                else:
-                    conn.execute(
-                        "INSERT INTO reputation (id, entity_type, entity_name, task_type, dispatch_count, created_at) VALUES (?, 'agent', ?, '', 1, datetime('now'))",
-                        (str(uuid4()), agent_name)
-                    )
-
-            conn.commit()
-
-            # ── Existing correction/doom_loop detection ──
-            sessions = conn.execute("""
-                SELECT s.id, s.workspace_id
-                FROM sessions s
-                WHERE s.ended_at IS NOT NULL
-                ORDER BY s.ended_at DESC
-                LIMIT 5
-            """).fetchall()
-
-            correction_pattern = re.compile(
-                r"\b(no|actually|wrong|don't|stop|that's not|incorrect|"
-                r"try again|fix it|instead|not what|mistake|error|revert|undo)\b",
-                re.IGNORECASE,
+        # Flush the final batch
+        if batch_message_ids and last_conversation_id is not None:
+            store.create_batch(last_conversation_id, batch_message_ids)
+            logger.debug(
+                "Created batch for conversation %s (%d messages)",
+                last_conversation_id,
+                len(batch_message_ids),
             )
 
-            for session in sessions:
-                sid = session["id"]
-                wid = session["workspace_id"]
+        logger.info("Ingested %d raw message(s)", ingested)
+        return ingested
 
-                # Get all tool-call type messages
-                tool_rows = conn.execute(
-                    """SELECT content, message_type, metadata, role
-                       FROM messages WHERE session_id=? AND message_type='tool_call'""",
-                    (sid,),
-                ).fetchall()
+    # ── Polling ─────────────────────────────────────────────────────────
 
-                # Get user messages with adjacent context
-                user_rows = conn.execute(
-                    """SELECT content, role, created_at
-                       FROM messages WHERE session_id=? AND role='user'
-                       ORDER BY created_at ASC""",
-                    (sid,),
-                ).fetchall()
+    def poll_once(self) -> int:
+        """
+        Single poll cycle: check for new messages and ingest them.
 
-                # Detect doom loop: >10 consecutive tool calls without user interjection
-                if len(tool_rows) > 10:
-                    # Find any agents/skills referenced in this session
-                    agent_names = conn.execute(
-                        """SELECT DISTINCT p.name FROM messages m
-                           JOIN peers p ON m.peer_id = p.id
-                           WHERE m.session_id=? AND p.name='agent'""",
-                        (sid,),
-                    ).fetchall()
-                    for agent_row in agent_names:
-                        try:
-                            import crud as _crud
-                            _crud.record_doom_loop("agent", agent_row["name"], "general")
-                        except Exception:
-                            pass
-
-                # Detect corrections in user messages
-                for msg in user_rows:
-                    if correction_pattern.search(msg["content"]):
-                        # Find the agent peer for this session
-                        agent_rows = conn.execute(
-                            """SELECT DISTINCT p.name FROM messages m
-                               JOIN peers p ON m.peer_id = p.id
-                               WHERE m.session_id=? AND p.name='agent'""",
-                            (sid,),
-                        ).fetchall()
-                        for agent_row in agent_rows:
-                            try:
-                                import crud as _crud
-                                _crud.record_correction("agent", agent_row["name"], "general")
-                            except Exception:
-                                pass
-                        break  # One correction event per session is enough
-        except Exception as e:
-            logger.warning(f"[reputation] Analysis error: {e}")
-        finally:
-            conn.close()
-
-    def _write_recommendations_json(self):
-        """Write pending recommendations to JSON file for TypeScript system prompt to read."""
+        Returns:
+            Number of messages ingested (0 if none or on error).
+        """
         try:
-            conn = get_db()
-            rows = conn.execute(
-                "SELECT * FROM recommendations WHERE status='pending' ORDER BY created_at DESC LIMIT 10"
-            ).fetchall()
-            conn.close()
-            recs = [dict(r) for r in rows]
-            output = {
-                "recommendations": recs,
-                "instruction": "Call the generate_agent tool NOW for each pending recommendation above to create the specialist agent. Do not skip this step.",
-            }
-            (Path.home() / ".evsmem" / "recommendations.json").write_text(json.dumps(output, indent=2))
-        except Exception as e:
-            logger.warning(f"[auto-gen] Failed to write recommendations.json: {e}")
-
-    def _check_auto_generate_trigger(self):
-        """Auto-generate specialist agents when reputation shows repeated poor performance.
-        Instead of calling generate_agent.py directly (which is invisible), writes
-        recommendations that the main agent can see in the system prompt and act on
-        via the generate_agent tool call (visible in TUI)."""
-        conn = get_db()
-        try:
-            rows = conn.execute("""
-                SELECT entity_name, task_type, dispatch_count, success_count, failure_count, correction_count
-                FROM reputation
-                WHERE entity_type='agent'
-                  AND dispatch_count >= 3
-                  AND task_type != ''
-                  AND (CAST(success_count AS REAL) / CAST(MAX(dispatch_count, 1) AS REAL)) < 0.5
-                ORDER BY dispatch_count DESC
-                LIMIT 3
-            """).fetchall()
-
-            for r in rows:
-                task_type = r["task_type"]
-                agent_name = task_type.lower().replace(" ", "-").replace("_", "-") + "-specialist"
-
-                # Check if agent already exists
-                exists = conn.execute("SELECT 1 FROM agents WHERE name=?", (agent_name,)).fetchone()
-                if exists:
-                    continue
-
-                # Check if recommendation already pending
-                already = conn.execute(
-                    "SELECT 1 FROM recommendations WHERE entity_name=? AND status='pending'",
-                    (agent_name,),
-                ).fetchone()
-                if already:
-                    continue
-
-                logger.info(f"[auto-gen] Recommending specialist for {task_type} "
-                            f"(dispatched {r['dispatch_count']}x, "
-                            f"success rate {r['success_count']}/{r['dispatch_count']})")
-
-                # Write recommendation for the main agent to act on (visible in TUI)
-                rid = str(uuid4())
-                conn.execute(
-                    """INSERT INTO recommendations
-                       (id, entity_type, entity_name, task_type, dispatch_count, failure_count, reason, status, created_at)
-                       VALUES (?, 'agent', ?, ?, ?, ?, ?, 'pending', datetime('now'))""",
-                    (rid, agent_name, task_type, r["dispatch_count"], r["failure_count"],
-                     f"Agent '{agent_name}' is recommended for {task_type} tasks "
-                     f"(dispatched {r['dispatch_count']}x, "
-                     f"failed {r['failure_count']}x, "
-                     f"success rate {r['success_count']}/{r['dispatch_count']}). "
-                     f"Use the generate_agent tool to create this specialist."),
-                )
-                conn.commit()
-
-                # Write notification for visibility
-                conn.execute(
-                    "INSERT INTO notifications (id, type, title, message, data) VALUES (?, 'agent_recommended', ?, ?, ?)",
-                    (str(uuid4()),
-                     f"Recommendation: {agent_name}",
-                     f"Recommended specialist agent for {task_type} tasks",
-                     json.dumps({"agent_name": agent_name, "task_type": task_type})),
-                )
-                conn.commit()
-
-            # Update JSON file for TypeScript system prompt
-            self._write_recommendations_json()
-
-        except Exception as e:
-            logger.warning(f"[auto-gen] Error: {e}")
-        finally:
-            conn.close()
+            messages = self.check_for_new_messages()
+            if messages:
+                return self.ingest(messages)
+            return 0
+        except Exception as exc:
+            logger.error("Deriver poll error: %s", exc, exc_info=True)
+            return 0
 
     def run_once(self) -> int:
-        """Sync ev-agent sessions to evsmem, process with LLM, then analyze."""
-        synced = self._sync_ev_sessions()
-        try:
-            self._process_new_messages_with_llm()
-        except Exception as e:
-            logger.warning(f"LLM processing error: {e}")
-        try:
-            self._analyze_session_reputation()
-        except Exception as e:
-            logger.warning(f"Reputation analysis error: {e}")
-        try:
-            self._check_auto_generate_trigger()
-        except Exception as e:
-            logger.warning(f"Auto-generate trigger error: {e}")
-        return synced
+        """Alias for :meth:`poll_once` — used by external schedulers."""
+        return self.poll_once()
 
-    def run_forever(self):
-        """Poll for new messages indefinitely."""
+    def start(self) -> None:
+        """Start the blocking polling loop."""
         self._running = True
-        logger.info(f"Deriver started (poll every {POLL_INTERVAL}s)")
+        logger.info(
+            "Deriver started (poll interval: %.1fs, ev-agent DB: %s)",
+            self.poll_interval,
+            self.evagent_db_path,
+        )
         while self._running:
-            try:
-                self.run_once()
-            except Exception as e:
-                logger.error(f"Deriver error: {e}", exc_info=True)
-            time.sleep(POLL_INTERVAL)
+            count = self.poll_once()
+            if count:
+                logger.debug("Deriver ingested %d message(s) in this cycle", count)
+            time.sleep(self.poll_interval)
 
-    def stop(self):
+    def stop(self) -> None:
+        """Signal the polling loop to exit."""
         self._running = False
+        logger.info("Deriver stopped")
 
 
-# ── Standalone entry point ──
-def start_deriver_thread() -> Deriver:
-    """Start the deriver in a background thread. Returns the deriver instance."""
-    d = Deriver()
-    t = Thread(target=d.run_forever, daemon=True)
+# ── Background thread helper ────────────────────────────────────────────
+
+
+def start_deriver_thread(
+    evagent_db_path: str | Path | None = None,
+    evsmem_db_path: str | Path | None = None,
+    poll_interval: float | None = None,
+) -> Deriver:
+    """Start the deriver in a daemon background thread. Returns the instance."""
+    d = Deriver(
+        evagent_db_path=evagent_db_path,
+        evsmem_db_path=evsmem_db_path,
+        poll_interval=poll_interval,
+    )
+    t = Thread(target=d.start, daemon=True, name="evsmem-deriver")
     t.start()
-    logger.info("Deriver thread started")
+    logger.info("Deriver thread started (daemon)")
     return d
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    print("Starting evsmem Deriver (standalone)...")
-    d = Deriver()
-    d.run_forever()
