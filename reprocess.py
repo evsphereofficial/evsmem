@@ -15,10 +15,17 @@ don't both load the 12B model into GPU memory at once.
 """
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
+
+# GPU-safety defaults (12GB VRAM): 12B Q4 model ~7GB weights + KV cache + BGE-M3.
+# Do NOT raise these on a 12GB card or the machine will OOM.
+os.environ.setdefault("LLM_N_CTX", "4096")
+os.environ.setdefault("LLM_MAX_TOKENS", "2048")
+# If it still OOMs, also set: LLM_GPU_LAYERS=20  (offloads most layers to CPU, slower but safe)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -45,7 +52,7 @@ def load_unprocessed(limit=0):
     sql = """SELECT m.rowid, m.id, m.content, m.role, m.session_id, s.workspace_id
              FROM messages m JOIN sessions s ON m.session_id = s.id
              WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
-             ORDER BY m.rowid ASC"""
+             ORDER BY m.rowid DESC"""
     if limit > 0:
         sql += f" LIMIT {limit}"
     rows = conn.execute(sql).fetchall()

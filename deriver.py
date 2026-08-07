@@ -219,7 +219,7 @@ class Deriver:
 
         raw = llm.generate(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=16384,
+            max_tokens=2048,
             temperature=0.1,
         )
 
