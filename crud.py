@@ -1153,7 +1153,7 @@ def record_evaluation(entity_type, entity_name, task_type, evaluation):
         # Track better_agent — keep the latest non-empty suggestion
         ba = evaluation.get("better_agent", "") or ""
         if not ba:
-            ba = existing.get("better_agent", "") or ""
+            ba = existing["better_agent"] or ""
 
         conn.execute("""
             UPDATE reputation SET

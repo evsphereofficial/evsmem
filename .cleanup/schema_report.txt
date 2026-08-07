@@ -1,0 +1,162 @@
+================================================================================
+EVSMEM SCHEMA REPORT — evsmem.db (READ-ONLY INSPECTION)
+================================================================================
+Inspected : C:\Users\Rehan\.evsmem\evsmem.db  (sqlite3, opened mode=ro)
+Inspected by: SQLite DDL / migration specialist subagent
+Date      : 2026-07-31
+No tables, rows, or triggers were modified during this inspection.
+
+--------------------------------------------------------------------------------
+1) CREATE STATEMENTS (from sqlite_master)
+--------------------------------------------------------------------------------
+-- memories (ordinary table)
+CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            user_id TEXT DEFAULT '',
+            agent_name TEXT DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'personal',
+            memory_type TEXT DEFAULT '',
+            content TEXT NOT NULL,
+            content_ts TEXT DEFAULT '',
+            embedding TEXT,
+            importance REAL DEFAULT 0.5,
+            confidence REAL DEFAULT 0.8,
+            observed_count INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'conversation',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        , project TEXT DEFAULT '')
+
+-- memories_fts (virtual table)
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+            content, memory_type, user_id, agent_name,
+            content='memories', content_rowid='rowid'
+        )
+
+NOTE: `id` is a TEXT PRIMARY KEY (UUID), NOT an INTEGER PRIMARY KEY. Therefore
+`rowid` is the implicit integer rowid assigned by SQLite to each memories row,
+and it is what memories_fts uses as its content_rowid. The mapping between
+memories.id (UUID) and memories.rowid (integer) must be resolved via
+"SELECT rowid FROM memories WHERE id=?".
+
+--------------------------------------------------------------------------------
+2) FTS TYPE AND ROWID RELATIONSHIP  (finding (a))
+--------------------------------------------------------------------------------
+memories_fts is EXTERNAL-CONTENT FTS5.
+
+  - content='memories'        -> FTS reads/writes index tokens but stores no
+                                 content copy; the shadow table
+                                 memories_fts_content does NOT exist.
+  - content_rowid='rowid'     -> each memories_fts rowid equals the integer
+                                 rowid of the corresponding memories row.
+                                 i.e. memories_fts.rowid == memories.rowid
+                                 (1:1 by rowid, NOT by memories.id UUID).
+
+Shadow tables present: memories_fts_config, memories_fts_data,
+memories_fts_idx, memories_fts_docsize. (No memories_fts_content.)
+
+Index state verified:
+  - memories total rows ......... 335
+  - memories_fts MATCH 'something' ..... 293  (index IS populated/synced)
+  - JOIN proof:
+      SELECT m.rowid, m.id, substr(m.content,1,40)
+      FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
+      WHERE memories_fts MATCH 'remember' LIMIT 3
+      -> rowids 10, 11, 12 with fake-memory contents (matches below).
+
+--------------------------------------------------------------------------------
+3) TRIGGERS  (finding (b))
+--------------------------------------------------------------------------------
+ZERO triggers exist in the entire database
+  (SELECT count(*) FROM sqlite_master WHERE type='trigger'  ->  0)
+
+=> FTS deletes (and inserts/updates) are NOT automatic. There are NO
+   AFTER INSERT / AFTER DELETE / AFTER UPDATE triggers keeping memories_fts
+   in sync. Synchronization is performed MANUALLY by application code in
+   crud.py:
+
+   - On memory create (crud.py:728-736):
+       rowid = conn.execute("SELECT rowid FROM memories WHERE id=?", (mid,)).fetchone()[0]
+       conn.execute(
+         "INSERT INTO memories_fts (rowid, content, memory_type, user_id, agent_name) "
+         "VALUES (?, ?, ?, ?, ?)", (rowid, content, type, user_id or '', agent_name or ''))
+   - On memory delete (crud.py:859-861) — delete_memory() is a SOFT delete:
+       conn.execute("DELETE FROM memories_fts WHERE rowid=?", (row["rowid"],))
+       then UPDATE memories SET content='', content_ts='__deleted__', embedding=NULL ...
+       (the memories row is retained as a tombstone; the FTS row is hard-deleted).
+
+   CRITICAL IMPLICATION: if rows are deleted from `memories` outside crud.py
+   (e.g. direct SQL, or a cleanup script), memories_fts will retain stale
+   entries and MATCH queries will return rows whose content no longer exists
+   (or NULLs). Any cleanup that deletes memories rows MUST delete the matching
+   memories_fts rowids in the same transaction. Conversely, if content is
+   updated in place (UPDATE memories SET content=...), the FTS index is NOT
+   re-synced — it must be updated manually too.
+
+--------------------------------------------------------------------------------
+4) memories COLUMN LIST (PRAGMA table_info order)
+--------------------------------------------------------------------------------
+ cid  name            type        notnull  pk  default
+  0   id              TEXT        0        1   (none)        -- UUID primary key
+  1   workspace_id    TEXT        1        0   (none)
+  2   user_id         TEXT        0        0   ''
+  3   agent_name      TEXT        0        0   ''
+  4   type            TEXT        1        0   'personal'
+  5   memory_type     TEXT        0        0   ''
+  6   content         TEXT        1        0   (none)
+  7   content_ts      TEXT        0        0   ''
+  8   embedding       TEXT        0        0   (none)         -- stored as TEXT (JSON), not BLOB
+  9   importance      REAL        0        0   0.5
+ 10   confidence      REAL        0        0   0.8
+ 11   observed_count  INTEGER     0        0   1
+ 12   source          TEXT        0        0   'conversation'
+ 13   metadata        TEXT        0        0   '{}'
+ 14   created_at      TEXT        1        0   datetime('now')
+ 15   updated_at      TEXT        1        0   datetime('now')
+ 16   project         TEXT        0        0   ''             -- appended via ALTER TABLE (no schema version guard)
+
+--------------------------------------------------------------------------------
+5) FAKE MEMORY COUNT + SAMPLE
+--------------------------------------------------------------------------------
+Query: SELECT COUNT(*) FROM memories WHERE lower(trim(content)) LIKE '%something to remember%'
+Count : 293 matching rows
+
+Sample (rowid, id, content):
+  rowid 10 | b3a25b07-528f-45e1-b896-6b05d6c3807c | something to remember
+  rowid 11 | 17841db9-8bf1-409d-a3b3-a3cdf3d567d0 | something to remember
+  rowid 12 | 1efbdce1-7a9d-42dc-8f36-126d7fc79f7f | something to remember
+
+--------------------------------------------------------------------------------
+6) EXACT SQL TO MAP memories rowid -> memories_fts rows  (finding (c))
+--------------------------------------------------------------------------------
+Because memories_fts is external-content with content_rowid='rowid', the FTS
+rowid IS the memories rowid. The mapping SQL is therefore a plain join on rowid:
+
+    SELECT m.rowid, m.id, m.content
+    FROM memories_fts f
+    JOIN memories m ON m.rowid = f.rowid
+    WHERE memories_fts MATCH '<query>';
+
+To delete a memory's FTS entry by memory id:
+
+    DELETE FROM memories_fts WHERE rowid IN (
+        SELECT rowid FROM memories WHERE id = ?
+    );
+
+To list FTS entries that are stale (memories row deleted but FTS row remains):
+
+    SELECT f.rowid FROM memories_fts f
+    LEFT JOIN memories m ON m.rowid = f.rowid
+    WHERE m.rowid IS NULL;
+
+Note: for external-content FTS5, DELETE/INSERT on memories_fts is only allowed
+with an explicit rowid (INSERT must supply rowid; DELETE must filter by rowid),
+and the 'delete' command form is INSERT INTO memories_fts(memories_fts, rowid,
+content) VALUES('delete', ?, ...). Plain "DELETE FROM memories_fts WHERE rowid=?"
+(as used in crud.py) also works because the rowid is unambiguous.
+
+================================================================================
+END OF REPORT
+================================================================================

@@ -47,12 +47,12 @@ Output a JSON object with these fields (only include relevant ones):
   "user_name": "extracted name or null",
   "user_mood": "detected mood or null",
   "user_preferences": ["preference1", "preference2"],
-  "memories": [{{"content": "something to remember", "importance": 0.5}}],
+  "memories": [{{"content": "User switched to a Rust CLI tool this week", "importance": 0.7}}],
   "conclusions": ["insight about user or project"],
   "agent_assessment": {{"agent_name": "...", "verdict": "positive|negative|neutral", "detail": "..."}}
 }}
 
-Return ONLY valid JSON, no other text."""
+Return ONLY valid JSON, no other text. Never copy the example text verbatim into your output."""
 
 
 def get_db() -> sqlite3.Connection:
@@ -112,7 +112,6 @@ class Deriver:
                    FROM messages m
                    JOIN sessions s ON m.session_id = s.id
                    WHERE m.rowid > ? AND m.role = 'user' AND m.content != ''
-                     AND m.content NOT LIKE '[auto:%'
                    ORDER BY m.rowid ASC""",
                 (self._last_processed_rowid,),
             ).fetchall()
@@ -345,6 +344,14 @@ class Deriver:
         for mem in memories:
             content = mem.get("content") if isinstance(mem, dict) else None
             if not content or not isinstance(content, str):
+                continue
+            content = content.strip()
+            if len(content) < 8:
+                continue
+            low = content.lower()
+            if low.startswith("something to remember") or low in (
+                "remember something", "a memory", "a memory to remember",
+            ):
                 continue
             importance = float(mem.get("importance", 0.5))
             try:
