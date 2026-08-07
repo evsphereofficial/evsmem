@@ -117,7 +117,7 @@ class Deriver:
         try:
             rows = conn.execute(
                 """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
-                          s.workspace_id
+                          s.workspace_id, m.metadata
                    FROM messages m
                    JOIN sessions s ON m.session_id = s.id
                    WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
@@ -126,17 +126,23 @@ class Deriver:
                    LIMIT 20""",
             ).fetchall()
 
-            return [
-                {
+            out = []
+            for r in rows:
+                meta = {}
+                try:
+                    meta = json.loads(r["metadata"] or "{}")
+                except Exception:
+                    pass
+                out.append({
                     "rowid": r["rowid"],
                     "id": r["id"],
                     "content": r["content"],
                     "role": r["role"],
                     "session_id": r["session_id"],
                     "workspace_id": r["workspace_id"],
-                }
-                for r in rows
-            ]
+                    "is_subagent": bool(meta.get("is_subagent", False)),
+                })
+            return out
         finally:
             conn.close()
 
@@ -168,29 +174,20 @@ class Deriver:
             return 0
 
         processed = 0
-        skipped = 0
-        processed_sessions = set()
         for msg in messages:
-            sid = msg.get("session_id")
             rowid = msg["rowid"]
             try:
-                if sid and sid in processed_sessions:
-                    self._mark_message_processed(rowid)
-                    skipped += 1
-                    continue
                 parsed = self._analyze_message_with_llm(llm, msg)
                 if parsed:
                     self._store_llm_results(parsed, msg)
-                    if sid:
-                        processed_sessions.add(sid)
                     processed += 1
-                self._mark_message_processed(rowid)
             except Exception as e:
                 logger.warning(f"LLM processing error for msg {rowid}: {e}")
+            finally:
                 self._mark_message_processed(rowid)
 
-        if processed > 0 or skipped > 0:
-            logger.info(f"Deriver: processed {processed} sessions, skipped {skipped} dup msgs")
+        if processed > 0:
+            logger.info(f"Deriver: processed {processed} messages")
         return processed
 
     def _analyze_message_with_llm(self, llm, msg: dict) -> Optional[dict]:
@@ -211,6 +208,14 @@ class Deriver:
             idx = content.find("] ", 6)
             if idx != -1:
                 content = content[idx+2:].strip()
+
+        if msg.get("is_subagent"):
+            content = (
+                "[NOTE: This message is from an INTERNAL SUBAGENT session (an AI subagent working a task), "
+                "NOT a direct statement from the human user. Do NOT infer the human user's name, preferences, "
+                "identity, or mood from it. Only extract concrete technical/project facts if clearly present.]\n"
+                + content
+            )
 
         if len(content) < 10:
             return None
@@ -693,8 +698,12 @@ class Deriver:
                             f"[auto:{row['session_id'][:16]}] [{row['session_title'] or '?'}] {content[:12000]}",
                             role,
                             "message",
-                            json.dumps({"scope": "session", "type": "auto-save",
-                                        "ev_session_id": row["session_id"]}),
+                            json.dumps({
+                                "scope": "session",
+                                "type": "auto-save",
+                                "ev_session_id": row["session_id"],
+                                "is_subagent": bool(row["session_title"] and "subagent" in str(row["session_title"]).lower()),
+                            }),
                             msg_emb_json,
                             datetime.fromtimestamp(row["time_created"] / 1000,
                                                     tz=timezone.utc).isoformat() if row["time_created"] else datetime.now(timezone.utc).isoformat(),
