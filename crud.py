@@ -75,7 +75,8 @@ def _init_schema(conn):
             message_type TEXT NOT NULL DEFAULT 'message',
             metadata TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
-            embedding TEXT
+            embedding TEXT,
+            is_processed INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS conclusions (
             id TEXT PRIMARY KEY,
@@ -229,6 +230,12 @@ def _init_schema(conn):
             conn.execute(f"ALTER TABLE reputation ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+    # Migration: add is_processed column to messages (safe for existing DBs)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN is_processed INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     conn.commit()
 
@@ -730,6 +737,16 @@ def get_memory(memory_id):
     if not row:
         return None
     return parse_row(row)
+
+
+def get_hot_memories(workspace_id, limit=15):
+    """Get hot memories (type='hot_memory') — always-injected, highest importance first."""
+    conn = get_db()
+    return [parse_row(r) for r in conn.execute(
+        "SELECT * FROM memories WHERE workspace_id=? AND type='hot_memory' "
+        "ORDER BY importance DESC, created_at DESC LIMIT ?",
+        (workspace_id, limit),
+    ).fetchall()]
 
 
 def search_memories(workspace_id, query_text, query_emb, type="", user_id="",

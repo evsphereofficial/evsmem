@@ -38,31 +38,41 @@ DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
 # Ev-agent session DB path
 EV_SESSION_DB = Path.home() / ".local" / "share" / "ev-agent" / "ev-agent-local.db"
 
-POLL_INTERVAL = float(os.getenv("DERIVER_POLL_INTERVAL", "30.0"))
+POLL_INTERVAL = float(os.getenv("DERIVER_POLL_INTERVAL", "5.0"))
 MAX_FACTS_PER_BATCH = int(os.getenv("DERIVER_MAX_FACTS", "10"))
 
 
 # ── LLM Analysis Prompt ──
 
 LLM_ANALYSIS_PROMPT = """\
-Analyze this message from a conversation between a user and an AI coding assistant.
+You are a meticulous memory-extraction engine for a conversation between a user and an AI coding assistant. Your ONLY job is to extract durable facts. Analyze the message carefully and output ONE valid JSON object.
 
 Message: "{content}"
 
-Output a JSON object with these fields (only include relevant ones):
+Required JSON schema:
 {{
-  "user_name": "extracted name or null",
-  "user_mood": "detected mood or null",
-  "user_preferences": ["preference1", "preference2"],
-  "memories": [{{"content": "a concrete fact or preference stated in THIS message", "importance": 0.7}}],
-  "conclusions": ["a new insight about the user or project, in your own words"],
-  "agent_assessment": {{"agent_name": "...", "verdict": "positive|negative|neutral", "detail": "..."}}
+  "user_name": "exact user name if stated, else null",
+  "user_mood": "detected mood (happy/frustrated/neutral/urgent/etc) or null",
+  "user_preferences": ["concrete stated preference 1", "preference 2"],
+  "hot_memories": [
+    {{"content": "a CRITICAL fact that must always be remembered", "importance": 0.9}},
+    {{"content": "another critical always-relevant fact", "importance": 0.95}}
+  ],
+  "cold_memories": [
+    {{"content": "a DETAILED, specific fact: include names, projects, versions, decisions, code paths, and enough context (2-3 sentences) to stand alone", "importance": 0.5}},
+    {{"content": "another detailed fact retrievable on request", "importance": 0.4}}
+  ],
+  "conclusions": ["a new insight about the user or project, phrased uniquely"],
+  "agent_assessment": {{"agent_name": "mentioned agent or ''", "verdict": "positive|negative|neutral", "detail": "one-line assessment"}}
 }}
 
-Rules:
-- Every "content" value must be derived from the message above. Never output generic placeholders, instructions, or made-up text.
-- If the message contains no memorable facts, set "memories" to [].
-- Return ONLY valid JSON, no other text."""
+Detailed rules:
+1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). These are always injected into context.
+2. COLD_MEMORIES = everything else worth keeping: specific technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned, anything the user might ask about later. Be DETAILED — include project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact is useful alone.
+3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
+4. importance scale: 0.0 (trivial) to 1.0 (must-never-forget). Use 0.8-1.0 for hot, 0.3-0.7 for cold.
+5. If the message has no memorable facts, output empty arrays: "hot_memories": [], "cold_memories": [], "conclusions": [].
+6. Return ONLY the JSON object. No markdown fences, no commentary."""
 
 
 def get_db() -> sqlite3.Connection:
@@ -79,6 +89,12 @@ def get_db() -> sqlite3.Connection:
                updated_at TEXT NOT NULL
            )"""
     )
+    # Ensure the is_processed column exists on messages (added by crud schema,
+    # but the deriver connects directly and must not depend on crud.get_db()).
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN is_processed INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -92,39 +108,22 @@ class Deriver:
     # ── Cursor-based message tracking ──
 
     def _get_unprocessed_messages(self) -> list[dict]:
-        """Get unprocessed messages — one at a time, no role filter.
+        """Get unprocessed user messages using the per-row is_processed flag.
 
-        Uses cursor-based tracking via deriver_state key 'last_processed_rowid'
-        to avoid reprocessing after restarts.
+        Only messages created within the last 7 days are considered, so
+        old/restored history is never LLM-processed.
         """
         conn = get_db()
         try:
-            # Initialize cursor from persistent state
-            if self._last_processed_rowid is None:
-                state = conn.execute(
-                    "SELECT value FROM deriver_state WHERE key='last_processed_rowid'"
-                ).fetchone()
-                if state:
-                    self._last_processed_rowid = int(state["value"])
-                else:
-                    row = conn.execute("SELECT MAX(rowid) FROM messages").fetchone()
-                    self._last_processed_rowid = row[0] if row and row[0] is not None else 0
-                    conn.execute(
-                        """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                           VALUES ('last_processed_rowid', ?, ?)""",
-                        (str(self._last_processed_rowid), datetime.now(timezone.utc).isoformat()),
-                    )
-                    conn.commit()
-
             rows = conn.execute(
                 """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
                           s.workspace_id
                    FROM messages m
                    JOIN sessions s ON m.session_id = s.id
-                   WHERE m.rowid > ? AND m.role = 'user' AND m.content != ''
+                   WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
                      AND m.created_at >= datetime('now', '-7 days')
-                   ORDER BY m.rowid ASC""",
-                (self._last_processed_rowid,),
+                   ORDER BY m.rowid ASC
+                   LIMIT 20""",
             ).fetchall()
 
             return [
@@ -141,21 +140,12 @@ class Deriver:
         finally:
             conn.close()
 
-    def _advance_message_cursor(self, rowid: int):
-        """Advance the LLM processing cursor (last_processed_rowid).
-
-        Separate from the sync cursor (last_synced_rowid) managed in
-        _sync_ev_sessions.
-        """
+    def _mark_message_processed(self, rowid: int):
+        """Mark a single message as processed (is_processed = 1)."""
         conn = get_db()
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
-                   VALUES ('last_processed_rowid', ?, ?)""",
-                (str(rowid), datetime.now(timezone.utc).isoformat()),
-            )
+            conn.execute("UPDATE messages SET is_processed = 1 WHERE rowid = ?", (rowid,))
             conn.commit()
-            self._last_processed_rowid = rowid
         finally:
             conn.close()
 
@@ -185,7 +175,7 @@ class Deriver:
             rowid = msg["rowid"]
             try:
                 if sid and sid in processed_sessions:
-                    self._advance_message_cursor(rowid)
+                    self._mark_message_processed(rowid)
                     skipped += 1
                     continue
                 parsed = self._analyze_message_with_llm(llm, msg)
@@ -194,10 +184,10 @@ class Deriver:
                     if sid:
                         processed_sessions.add(sid)
                     processed += 1
-                self._advance_message_cursor(rowid)
+                self._mark_message_processed(rowid)
             except Exception as e:
                 logger.warning(f"LLM processing error for msg {rowid}: {e}")
-                self._advance_message_cursor(rowid)
+                self._mark_message_processed(rowid)
 
         if processed > 0 or skipped > 0:
             logger.info(f"Deriver: processed {processed} sessions, skipped {skipped} dup msgs")
@@ -229,7 +219,7 @@ class Deriver:
 
         raw = llm.generate(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
+            max_tokens=16384,
             temperature=0.1,
         )
 
@@ -344,65 +334,77 @@ class Deriver:
                 logger.debug(f"Failed to store conclusion: {e}")
 
     def _store_llm_memories(self, parsed: dict, workspace_id: str, session_id: str):
-        """Store long-term memory items with embeddings via crud."""
-        memories = parsed.get("memories")
-        if not memories or not isinstance(memories, list):
-            return
+        """Store long-term memory items with embeddings via crud.
 
+        Supports three tiers from the LLM output:
+          - hot_memories   -> type='hot_memory'   (critical, always injected)
+          - cold_memories  -> type='cold_memory'  (detailed, on-demand)
+          - memories       -> type='conversation_insight' (legacy generic)
+        """
         from embeddings import EmbeddingClient
 
         _ec = EmbeddingClient()
         import crud as _crud
 
-        for mem in memories:
-            content = mem.get("content") if isinstance(mem, dict) else None
-            if not content or not isinstance(content, str):
-                continue
-            content = content.strip()
-            if len(content) < 8:
-                continue
-            low = content.lower()
-            if low.startswith("something to remember") or low.startswith("user switched to a rust cli tool") or low.startswith("a concrete fact or preference") or low in (
-                "remember something", "a memory", "a memory to remember",
-            ):
-                continue
+        tiers = (
+            ("hot_memories", "hot_memory", 0.9),
+            ("cold_memories", "cold_memory", 0.5),
+            ("memories", "conversation_insight", 0.5),
+        )
 
-            # Exact-content dedup: skip if this memory already exists for the workspace
-            try:
-                dconn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
-                dup = dconn.execute(
-                    "SELECT 1 FROM memories WHERE workspace_id=? AND lower(trim(content))=lower(trim(?)) LIMIT 1",
-                    (workspace_id, content),
-                ).fetchone()
-                dconn.close()
-                if dup:
-                    logger.info(f"Duplicate memory skipped: {len(content)} chars")
+        for key, mem_type, default_imp in tiers:
+            items = parsed.get(key)
+            if not items or not isinstance(items, list):
+                continue
+            for mem in items:
+                content = mem.get("content") if isinstance(mem, dict) else None
+                if not content or not isinstance(content, str):
                     continue
-            except Exception:
-                pass
+                content = content.strip()
+                if len(content) < 8:
+                    continue
+                low = content.lower()
+                if low.startswith("something to remember") or low.startswith("user switched to a rust cli tool") or low.startswith("a concrete fact or preference") or low in (
+                    "remember something", "a memory", "a memory to remember",
+                ):
+                    continue
 
-            importance = float(mem.get("importance", 0.5))
-            try:
-                emb = None
-                if _ec.is_available():
-                    try:
-                        emb = _ec.embed(content[:2000])
-                    except Exception:
-                        pass
+                # Exact-content dedup: skip if this memory already exists for the workspace
+                try:
+                    dconn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
+                    dup = dconn.execute(
+                        "SELECT 1 FROM memories WHERE workspace_id=? AND lower(trim(content))=lower(trim(?)) LIMIT 1",
+                        (workspace_id, content),
+                    ).fetchone()
+                    dconn.close()
+                    if dup:
+                        logger.info(f"Duplicate memory skipped: {len(content)} chars")
+                        continue
+                except Exception:
+                    pass
 
-                logger.info(f"Storing memory: {len(content)} chars")
-                _crud.create_memory(
-                    workspace_id=workspace_id,
-                    type="conversation_insight",
-                    content=content,
-                    importance=importance,
-                    confidence=0.8,
-                    source="deriver_llm",
-                    metadata={"session_id": session_id},
-                    embedding=emb,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to store memory: {e}")
+                importance = float(mem.get("importance", default_imp))
+                try:
+                    emb = None
+                    if _ec.is_available():
+                        try:
+                            emb = _ec.embed(content[:2000])
+                        except Exception:
+                            pass
+
+                    logger.info(f"Storing {mem_type}: {len(content)} chars")
+                    _crud.create_memory(
+                        workspace_id=workspace_id,
+                        type=mem_type,
+                        content=content,
+                        importance=importance,
+                        confidence=0.8,
+                        source="deriver_llm",
+                        metadata={"session_id": session_id, "tier": mem_type},
+                        embedding=emb,
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to store memory: {e}")
 
     def _update_peer_from_llm(self, parsed: dict, workspace_id: str):
         """Update user peer metadata with extracted user info."""

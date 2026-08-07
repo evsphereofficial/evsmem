@@ -490,6 +490,13 @@ async def preflight_command(name: str, body: models.PreflightRequest):
     return crud.preflight_command(ws["id"], body.command, q_emb)
 
 
+@app.get("/workspace/by-name/{name}/memories/hot")
+async def get_hot_memories_endpoint(name: str, limit: int = Query(15)):
+    """Get hot memories (always-injected) — highest importance first."""
+    ws = crud.get_or_create_workspace(name)
+    return {"memories": crud.get_hot_memories(ws["id"], limit)}
+
+
 @app.get("/memories/{memory_id}")
 async def get_memory(memory_id: str):
     """Get a single memory by ID."""

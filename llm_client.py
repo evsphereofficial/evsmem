@@ -15,10 +15,10 @@ if not logger.handlers:
 # Resolve GGUF model path
 _MODEL_PATH = os.getenv(
     "LLM_MODEL_PATH",
-    str(Path(__file__).resolve().parent / "models" / "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
+    str(Path(__file__).resolve().parent / "models" / "gemma-4-12B-it-QAT-GGUF" / "gemma-4-12B-it-QAT-Q4_0.gguf"),
 )
-_N_CTX = int(os.getenv("LLM_N_CTX", "4096"))
-_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+_N_CTX = int(os.getenv("LLM_N_CTX", "32768"))
+_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 _GPU_LAYERS = int(os.getenv("LLM_GPU_LAYERS", "-1"))
 
 # Add CUDA DLL directory so llama_cpp can find them at import time
@@ -107,4 +107,4 @@ class LLMClient:
 
     def model_name(self) -> str:
         """Return the model filename."""
-        return "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+        return "gemma-4-12B-it-QAT-Q4_0.gguf"
