@@ -25,6 +25,13 @@ from typing import Any, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
 
 DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
 
@@ -47,12 +54,15 @@ Output a JSON object with these fields (only include relevant ones):
   "user_name": "extracted name or null",
   "user_mood": "detected mood or null",
   "user_preferences": ["preference1", "preference2"],
-  "memories": [{{"content": "User switched to a Rust CLI tool this week", "importance": 0.7}}],
-  "conclusions": ["insight about user or project"],
+  "memories": [{{"content": "a concrete fact or preference stated in THIS message", "importance": 0.7}}],
+  "conclusions": ["a new insight about the user or project, in your own words"],
   "agent_assessment": {{"agent_name": "...", "verdict": "positive|negative|neutral", "detail": "..."}}
 }}
 
-Return ONLY valid JSON, no other text. Never copy the example text verbatim into your output."""
+Rules:
+- Every "content" value must be derived from the message above. Never output generic placeholders, instructions, or made-up text.
+- If the message contains no memorable facts, set "memories" to [].
+- Return ONLY valid JSON, no other text."""
 
 
 def get_db() -> sqlite3.Connection:
@@ -112,6 +122,7 @@ class Deriver:
                    FROM messages m
                    JOIN sessions s ON m.session_id = s.id
                    WHERE m.rowid > ? AND m.role = 'user' AND m.content != ''
+                     AND m.created_at >= datetime('now', '-7 days')
                    ORDER BY m.rowid ASC""",
                 (self._last_processed_rowid,),
             ).fetchall()
@@ -296,7 +307,7 @@ class Deriver:
         try:
             conn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
             seen = set(row[0] for row in conn.execute(
-                "SELECT content FROM conclusions WHERE session_id=?", (session_id,)
+                "SELECT content FROM conclusions"
             ).fetchall())
             conn.close()
         except Exception:
@@ -307,6 +318,8 @@ class Deriver:
                 continue
             conc_text = conc_text.strip()
             if not conc_text or conc_text in seen:
+                continue
+            if len(conc_text) < 8 or conc_text.lower().startswith("something to remember"):
                 continue
             seen.add(conc_text)
             try:
@@ -349,10 +362,25 @@ class Deriver:
             if len(content) < 8:
                 continue
             low = content.lower()
-            if low.startswith("something to remember") or low in (
+            if low.startswith("something to remember") or low.startswith("user switched to a rust cli tool") or low.startswith("a concrete fact or preference") or low in (
                 "remember something", "a memory", "a memory to remember",
             ):
                 continue
+
+            # Exact-content dedup: skip if this memory already exists for the workspace
+            try:
+                dconn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
+                dup = dconn.execute(
+                    "SELECT 1 FROM memories WHERE workspace_id=? AND lower(trim(content))=lower(trim(?)) LIMIT 1",
+                    (workspace_id, content),
+                ).fetchone()
+                dconn.close()
+                if dup:
+                    logger.info(f"Duplicate memory skipped: {len(content)} chars")
+                    continue
+            except Exception:
+                pass
+
             importance = float(mem.get("importance", 0.5))
             try:
                 emb = None
@@ -362,6 +390,7 @@ class Deriver:
                     except Exception:
                         pass
 
+                logger.info(f"Storing memory: {len(content)} chars")
                 _crud.create_memory(
                     workspace_id=workspace_id,
                     type="conversation_insight",
@@ -621,8 +650,8 @@ class Deriver:
                     ).fetchone()
                     if not user_peer:
                         hcon.execute(
-                            "INSERT INTO peers (id, workspace_id, name, metadata) VALUES (?, ?, ?, ?)",
-                            (str(uuid4()), wid, "user", "{}"),
+                            "INSERT INTO peers (id, workspace_id, name, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (str(uuid4()), wid, "user", "{}", datetime.now(timezone.utc).isoformat()),
                         )
                         hcon.commit()
                         user_peer = hcon.execute(
@@ -637,8 +666,8 @@ class Deriver:
                     ).fetchone()
                     if not agent_peer:
                         hcon.execute(
-                            "INSERT INTO peers (id, workspace_id, name, metadata) VALUES (?, ?, ?, ?)",
-                            (str(uuid4()), wid, "agent", "{}"),
+                            "INSERT INTO peers (id, workspace_id, name, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (str(uuid4()), wid, "agent", "{}", datetime.now(timezone.utc).isoformat()),
                         )
                         hcon.commit()
                         agent_peer = hcon.execute(

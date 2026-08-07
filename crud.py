@@ -230,12 +230,6 @@ def _init_schema(conn):
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-            content, memory_type, user_id, agent_name,
-            content='memories', content_rowid='rowid'
-        );
-    """)
     conn.commit()
 
 
@@ -725,15 +719,6 @@ def create_memory(workspace_id, type, content, user_id=None, agent_name=None,
          emb_json, importance, confidence, 1, source,
          metadata_json, _ts(), _ts()),
     )
-    # Sync FTS5 with the same content
-    rowid = conn.execute("SELECT rowid FROM memories WHERE id=?", (mid,)).fetchone()[0]
-    try:
-        conn.execute(
-            "INSERT INTO memories_fts (rowid, content, memory_type, user_id, agent_name) VALUES (?, ?, ?, ?, ?)",
-            (rowid, content, type, user_id or '', agent_name or ''),
-        )
-    except sqlite3.OperationalError:
-        pass  # FTS table may not exist (e.g. if sqlite compiled without FTS5)
     conn.commit()
     return get_memory(mid)
 
@@ -770,11 +755,9 @@ def search_memories(workspace_id, query_text, query_emb, type="", user_id="",
 
     where_sql = " AND ".join(where_parts)
 
-    # 2. Load memories with optional FTS rank
-    #    fts.rank is negative (BM25 score), lower = better match
-    sql = f"""SELECT m.rowid, m.*, fts.rank
+    # 2. Load memories (keyword scoring computed in Python, no FTS dependency)
+    sql = f"""SELECT m.rowid, m.*
               FROM memories m
-              LEFT JOIN memories_fts fts ON m.rowid = fts.rowid
               WHERE {where_sql}
               ORDER BY m.created_at DESC"""
 
@@ -782,6 +765,13 @@ def search_memories(workspace_id, query_text, query_emb, type="", user_id="",
 
     if not rows:
         return []
+
+    # 2b. Extract significant words from the text query for keyword scoring
+    _stop = {"the","a","an","and","for","with","from","to","of","in","on","at","by","is","are","was","were","be","this","that","it","its"}
+    query_words = [
+        w for w in re.findall(r"[a-zA-Z0-9]{3,}", (query_text or "").lower())
+        if w not in _stop
+    ]
 
     # 3. Normalize query embedding (if available)
     q = None
@@ -809,11 +799,12 @@ def search_memories(workspace_id, query_text, query_emb, type="", user_id="",
                 if v_norm > 1e-10:
                     sem_score = float(np.dot(q, v / v_norm))
 
-        # Keyword score — FTS rank is negative (lower = better match)
+        # Keyword score — fraction of query words present in content
         kw_score = 0.0
-        rank = r["rank"]
-        if rank is not None and rank < 0:
-            kw_score = 1.0 / (1.0 + abs(rank))
+        content_lower = (r["content"] or "").lower()
+        if query_words and content_lower:
+            hits = sum(1 for w in query_words if w in content_lower)
+            kw_score = hits / len(query_words)
 
         # Importance (boost high-importance memories)
         imp_score = r["importance"] if include_importance else 0.0
@@ -856,11 +847,6 @@ def delete_memory(memory_id):
     conn = get_db()
     row = conn.execute("SELECT rowid FROM memories WHERE id=?", (memory_id,)).fetchone()
     if row:
-        # Remove from FTS first
-        try:
-            conn.execute("DELETE FROM memories_fts WHERE rowid=?", (row["rowid"],))
-        except sqlite3.OperationalError:
-            pass
         # Soft delete: clear content and mark
         conn.execute(
             "UPDATE memories SET content='', content_ts='__deleted__', embedding=NULL, updated_at=? WHERE id=?",
