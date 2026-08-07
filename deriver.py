@@ -110,8 +110,10 @@ class Deriver:
     def _get_unprocessed_messages(self) -> list[dict]:
         """Get unprocessed user messages using the per-row is_processed flag.
 
-        Only messages created within the last 7 days are considered, so
-        old/restored history is never LLM-processed.
+        Only messages created within the last 7 days AND older than 60 seconds
+        are considered — so assistant streams have settled and old/restored
+        history is never LLM-processed. (Raw storage is instant; this only
+        gates the LLM analysis.)
         """
         conn = get_db()
         try:
@@ -122,6 +124,7 @@ class Deriver:
                    JOIN sessions s ON m.session_id = s.id
                    WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
                      AND m.created_at >= datetime('now', '-7 days')
+                     AND m.created_at <= datetime('now', '-60 seconds')
                    ORDER BY m.rowid ASC
                    LIMIT 20""",
             ).fetchall()
@@ -510,19 +513,18 @@ class Deriver:
             src = sqlite3.connect(str(EV_SESSION_DB))
             src.row_factory = sqlite3.Row
 
-            # Get settled messages newer than last sync cursor (settle delay so
-            # assistant streams finish before we capture them), ordered by rowid ASC
-            settle_ms = int(os.getenv("DERIVER_SYNC_SETTLE_MS", "60000"))
+            # Get all messages newer than the sync cursor, ordered by rowid ASC.
+            # Every message is stored INSTANTLY (upsert by source id) — partial
+            # streams get replaced by their final text on later polls.
             rows = src.execute("""
                 SELECT m.rowid, m.id, m.session_id, m.data, m.time_created,
                        s.title AS session_title
                 FROM message m
                 JOIN session s ON m.session_id = s.id
                 WHERE m.rowid > ?
-                  AND m.time_created <= (strftime('%s', 'now') * 1000) - ?
                 ORDER BY m.rowid ASC
                 LIMIT 50
-            """, (last_rowid, settle_ms)).fetchall()
+            """, (last_rowid,)).fetchall()
 
             if not rows:
                 src.close()
@@ -533,9 +535,8 @@ class Deriver:
             # request that should not hold the evsmem DB connection open.
             prepared = []
             max_rowid = last_rowid
+            settle_ms = 60000
             for row in rows:
-                max_rowid = max(max_rowid, row["rowid"])
-
                 try:
                     data = json.loads(row["data"]) if isinstance(row["data"], str) else (row["data"] or {})
                 except (json.JSONDecodeError, TypeError):
@@ -559,7 +560,20 @@ class Deriver:
                         if text and len(text) > 2:
                             text_parts.append(text[:2000])
                 content = " | ".join(text_parts[:5]) if text_parts else str(data.get("summary", ""))[:500]
+
+                # A message is "settled" once it is old enough that streaming is
+                # guaranteed done. Everything is stored INSTANTLY, but the sync
+                # cursor only advances past settled messages so in-flight
+                # (partial) messages are re-fetched and upserted to their final
+                # text on later polls.
+                now_ms = int(time.time() * 1000)
+                settled = (not row["time_created"]) or ((now_ms - row["time_created"]) >= settle_ms)
+
                 if not content:
+                    if settled:
+                        max_rowid = max(max_rowid, row["rowid"])
+                    else:
+                        break  # still streaming; hold the cursor
                     continue
 
                 # Embed from full content (BEFORE evsmem connection opens)
@@ -590,6 +604,11 @@ class Deriver:
                     "msg_emb_json": msg_emb_json,
                     "deterministic_id": deterministic_id,
                 })
+
+                if settled:
+                    max_rowid = max(max_rowid, row["rowid"])
+                else:
+                    break  # stored now, but hold cursor until streaming completes
 
             src.close()
 
