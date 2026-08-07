@@ -1,7 +1,23 @@
-"""Embedding client — GGUF BGE-M3 via llama-cpp-python with CUDA."""
+"""BGE-M3 embedding engine using sentence-transformers.
 
-import logging, os, threading, time
+Provides a functional API (generate_embedding, generate_embeddings_batch, embedding_dimension)
+and a backward-compatible EmbeddingClient class for existing consumers.
+"""
+
+from __future__ import annotations
+
+__all__ = [
+    "generate_embedding",
+    "generate_embeddings_batch",
+    "embedding_dimension",
+    "EmbeddingClient",
+]
+
+import logging
+import os
+import threading
 from pathlib import Path
+
 import numpy as np
 
 logger = logging.getLogger("evsmem.embeddings")
@@ -13,112 +29,139 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(ch)
 
-# Resolve GGUF model path
-_MODEL_PATH = os.getenv(
-    "EMBEDDING_MODEL",
-    str(Path(__file__).resolve().parent / "models" / "bge-m3-Q8_0.gguf"),
-)
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "http://localhost:1234")
-LM_STUDIO_MODEL = os.getenv("LM_STUDIO_EMBEDDING_MODEL", "text-embedding-bge-m3")
+# ── Lazy-loaded model singleton ───────────────────────────────────────────
 
-# Add CUDA DLL directory so llama_cpp can find them at import time
-_venv_lib = Path(__file__).resolve().parent.parent / ".venv" / "Lib" / "site-packages"
-_cuda_dll_dir = str(_venv_lib / "llama_cpp" / "lib")
-if os.path.isdir(_cuda_dll_dir):
-    try:
-        os.add_dll_directory(_cuda_dll_dir)
-    except Exception:
-        pass
-
-# Global singleton
 _model = None
-_MODEL_LOCK = threading.Lock()
+_device = None
+_lock = threading.Lock()
 
 
-def _load_model():
-    """Load BGE-M3 GGUF once (GPU if available). Stays in memory."""
-    global _model
+def _get_model():
+    """Load BGE-M3 via sentence-transformers on first call. Thread-safe."""
+    global _model, _device
     if _model is not None:
         return _model
-    with _MODEL_LOCK:
+    with _lock:
         if _model is not None:
             return _model
-        if not os.path.isfile(_MODEL_PATH):
-            logger.warning(f"Model not found at {_MODEL_PATH}")
-            return None
         try:
-            from llama_cpp import Llama
-            logger.info(f"Loading GGUF model from {_MODEL_PATH}")
-            t0 = time.time()
-            _model = Llama(
-                model_path=str(_MODEL_PATH),
-                embedding=True,
-                n_gpu_layers=-1,
-                n_ctx=2048,
-                verbose=False,
+            from sentence_transformers import SentenceTransformer
+            import torch
+
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info("Loading BGE-M3 model on %s ...", _device)
+            _model = SentenceTransformer("BAAI/bge-m3", device=_device)
+            logger.info("BGE-M3 model loaded successfully.")
+        except ImportError:
+            logger.error(
+                "sentence-transformers not installed. Run: pip install sentence-transformers"
             )
-            logger.info(f"Model ready ({time.time()-t0:.1f}s)")
-            return _model
-        except Exception as e:
-            logger.warning(f"GGUF model load failed: {e}")
-            return None
+            raise
+        except Exception as exc:
+            logger.error("Failed to load BGE-M3 model: %s", exc)
+            raise
+    return _model
+
+
+# ── Public functional API ─────────────────────────────────────────────────
+
+
+def generate_embedding(text: str) -> list[float]:
+    """Generate a single BGE-M3 embedding for *text*.
+
+    Returns a 1024-dimensional float vector normalized to unit length.
+    Returns a zero vector for empty / whitespace-only input.
+    """
+    if not text or not text.strip():
+        return [0.0] * 1024
+    model = _get_model()
+    emb = model.encode(text, normalize_embeddings=True)
+    return emb.tolist()
+
+
+def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Generate BGE-M3 embeddings for a batch of texts.
+
+    Empty strings are returned as zero vectors.  This is more efficient than
+    calling ``generate_embedding`` in a loop because the model processes the
+    entire batch at once.
+    """
+    if not texts:
+        return []
+
+    cleaned: list[str] = []
+    empty_indices: list[int] = []
+    for i, t in enumerate(texts):
+        if t and t.strip():
+            cleaned.append(t)
+        else:
+            cleaned.append("")
+            empty_indices.append(i)
+
+    model = _get_model()
+    embs = model.encode(cleaned, normalize_embeddings=True)
+
+    results: list[list[float]] = []
+    for i, emb in enumerate(embs):
+        if not cleaned[i]:
+            results.append([0.0] * 1024)
+        else:
+            results.append(emb.tolist())
+    return results
+
+
+def embedding_dimension() -> int:
+    """Return the embedding dimensionality (1024 for BGE-M3)."""
+    return 1024
+
+
+# ── Backward-compatible class wrapper ─────────────────────────────────────
 
 
 class EmbeddingClient:
-    """Embedding client — loads GGUF model once via llama-cpp-python."""
+    """Backward-compatible embedding client wrapping sentence-transformers BGE-M3.
 
-    def __init__(self):
+    Preserves the same interface as the previous llama-cpp-python / LM Studio
+    implementation so that existing consumers (main.py, deriver.py) continue
+    to work without modification.
+    """
+
+    def __init__(self) -> None:
         self._loaded = False
 
-    def _ensure_model(self):
+    def _ensure_model(self) -> None:
+        """Trigger lazy model load (idempotent)."""
         if not self._loaded:
-            _load_model()
+            _get_model()
             self._loaded = True
 
     def embed(self, text: str) -> list[float]:
+        """Embed a single text string."""
         self._ensure_model()
-        logger.info(f"Embedding: {len(text)} chars")
-        if _model is not None:
-            try:
-                result = _model.create_embedding(text[:12000])
-                return result["data"][0]["embedding"]
-            except Exception as e:
-                logger.warning(f"Embedding failed: {e}")
-        import requests
-        resp = requests.post(
-            f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings",
-            json={"model": LM_STUDIO_MODEL, "input": text},
-            timeout=(5, 30),
-        )
-        resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
+        return generate_embedding(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of text strings."""
         self._ensure_model()
-        if _model is not None:
-            try:
-                return [
-                    _model.create_embedding(t[:12000])["data"][0]["embedding"]
-                    for t in texts
-                ]
-            except Exception as e:
-                logger.warning(f"Batch embedding failed: {e}")
-        import requests
-        resp = requests.post(
-            f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings",
-            json={"model": LM_STUDIO_MODEL, "input": texts},
-            timeout=(5, 60),
-        )
-        resp.raise_for_status()
-        return [d["embedding"] for d in resp.json()["data"]]
+        return generate_embeddings_batch(texts)
 
-    def cosine_similarity(self, a, b):
+    def cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors."""
         a_np = np.array(a, dtype=np.float32)
         b_np = np.array(b, dtype=np.float32)
-        return float(np.dot(a_np, b_np) / (np.linalg.norm(a_np) * np.linalg.norm(b_np) + 1e-10))
+        return float(
+            np.dot(a_np, b_np)
+            / (np.linalg.norm(a_np) * np.linalg.norm(b_np) + 1e-10)
+        )
 
     def is_available(self) -> bool:
-        return os.path.isfile(_MODEL_PATH)
+        """Return True if the BGE-M3 model is loadable."""
+        try:
+            _get_model()
+            return _model is not None
+        except Exception:
+            return False
 
     def model_name(self) -> str:
-        return "bge-m3-Q8_0.gguf"
+        """Return the HuggingFace model identifier."""
+        return "BAAI/bge-m3"
