@@ -510,16 +510,19 @@ class Deriver:
             src = sqlite3.connect(str(EV_SESSION_DB))
             src.row_factory = sqlite3.Row
 
-            # Get messages newer than last sync cursor, ordered by rowid ASC
+            # Get settled messages newer than last sync cursor (settle delay so
+            # assistant streams finish before we capture them), ordered by rowid ASC
+            settle_ms = int(os.getenv("DERIVER_SYNC_SETTLE_MS", "60000"))
             rows = src.execute("""
                 SELECT m.rowid, m.id, m.session_id, m.data, m.time_created,
                        s.title AS session_title
                 FROM message m
                 JOIN session s ON m.session_id = s.id
                 WHERE m.rowid > ?
+                  AND m.time_created <= (strftime('%s', 'now') * 1000) - ?
                 ORDER BY m.rowid ASC
                 LIMIT 50
-            """, (last_rowid,)).fetchall()
+            """, (last_rowid, settle_ms)).fetchall()
 
             if not rows:
                 src.close()
@@ -553,7 +556,7 @@ class Deriver:
                         pd = {}
                     if pd.get("type") in ("text", "reasoning"):
                         text = (pd.get("text") or "").strip()
-                        if text and len(text) > 20:
+                        if text and len(text) > 2:
                             text_parts.append(text[:2000])
                 content = " | ".join(text_parts[:5]) if text_parts else str(data.get("summary", ""))[:500]
                 if not content:
@@ -561,24 +564,24 @@ class Deriver:
 
                 # Embed from full content (BEFORE evsmem connection opens)
                 msg_emb = None
-                try:
-                    from embeddings import EmbeddingClient
-                    _ec = EmbeddingClient()
-                    if _ec.is_available():
-                        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-                        with ThreadPoolExecutor(max_workers=1) as pool:
-                            future = pool.submit(_ec.embed, content[:8000])
-                            msg_emb = future.result(timeout=15)
-                except FutureTimeout:
-                    logger.warning("Embedding timed out (15s) - skipping")
-                except Exception:
-                    pass
+                if os.getenv("DERIVER_SYNC_NO_EMBED") != "1":
+                    try:
+                        from embeddings import EmbeddingClient
+                        _ec = EmbeddingClient()
+                        if _ec.is_available():
+                            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+                            with ThreadPoolExecutor(max_workers=1) as pool:
+                                future = pool.submit(_ec.embed, content[:8000])
+                                msg_emb = future.result(timeout=15)
+                    except FutureTimeout:
+                        logger.warning("Embedding timed out (15s) - skipping")
+                    except Exception:
+                        pass
                 msg_emb_json = json.dumps(msg_emb) if msg_emb else None
 
-                # Deterministic message ID from canonical fields
-                time_created = row["time_created"]
-                hash_input = f"{row['session_id']}:{role}:{content}:{time_created}"
-                deterministic_id = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+                # Stable ID derived from the SOURCE message id — survives content
+                # updates (reasoning-only -> final text) and prevents duplicates.
+                deterministic_id = hashlib.sha256(row["id"].encode()).hexdigest()[:16]
 
                 prepared.append({
                     "row": row,
@@ -688,9 +691,18 @@ class Deriver:
                         continue
 
                     hcon.execute(
-                        """INSERT OR IGNORE INTO messages
-                           (id, session_id, peer_id, content, role, message_type, metadata, embedding, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        """INSERT INTO messages
+                           (id, session_id, peer_id, content, role, message_type, metadata, embedding, created_at, is_processed)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                           ON CONFLICT(id) DO UPDATE SET
+                             session_id=excluded.session_id,
+                             peer_id=excluded.peer_id,
+                             content=excluded.content,
+                             role=excluded.role,
+                             metadata=excluded.metadata,
+                             embedding=excluded.embedding,
+                             created_at=excluded.created_at,
+                             is_processed=CASE WHEN messages.content = excluded.content THEN messages.is_processed ELSE 0 END""",
                         (
                             deterministic_id,
                             evsmem_sid,
