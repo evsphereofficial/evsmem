@@ -244,6 +244,20 @@ def _init_schema(conn):
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(workspace_id)
         );
+        CREATE TABLE IF NOT EXISTS agent_written_memory (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            content TEXT NOT NULL,
+            memory_type TEXT DEFAULT 'agent_note',
+            importance REAL DEFAULT 0.6,
+            confidence REAL DEFAULT 0.8,
+            durability REAL DEFAULT 0.5,
+            source TEXT DEFAULT 'agent',
+            metadata TEXT DEFAULT '{}',
+            embedding TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS reputation (
             id TEXT PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -1036,6 +1050,84 @@ def get_user(workspace_id):
     conn = get_db()
     row = conn.execute("SELECT * FROM users WHERE workspace_id=?", (workspace_id,)).fetchone()
     return parse_row(row) if row else None
+
+
+def create_agent_written_memory(workspace_id, content, memory_type="agent_note", importance=0.6,
+                                confidence=0.8, durability=0.5, metadata=None, embedding=None):
+    """Store a memory written by the agent itself (agent_written_memory)."""
+    conn = get_db()
+    mid = _uuid()
+    conn.execute(
+        """INSERT INTO agent_written_memory
+           (id, workspace_id, content, memory_type, importance, confidence, durability,
+            source, metadata, embedding, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?)""",
+        (mid, workspace_id, content, memory_type, importance, confidence, durability,
+         json.dumps(metadata or {}), json.dumps(embedding) if embedding else None, _ts(), _ts()),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM agent_written_memory WHERE id=?", (mid,)).fetchone()
+    return parse_row(row)
+
+
+def list_agent_written_memories(workspace_id, limit=50):
+    conn = get_db()
+    return [parse_row(r) for r in conn.execute(
+        "SELECT * FROM agent_written_memory WHERE workspace_id=? ORDER BY created_at DESC LIMIT ?",
+        (workspace_id, limit),
+    ).fetchall()]
+
+
+def search_memory_table(workspace_id, table, query_text="", query_emb=None, top_n=10):
+    """Semantic search across one of the memory tables:
+    memories | conclusions | preferences | behaviour | users | agent_written_memory.
+    'users' is structured (no embedding) and uses keyword search; the rest use
+    BGE-M3 cosine similarity on their stored embeddings."""
+    import numpy as np
+    table = (table or "").strip().lower()
+    tables_with_embeddings = {"memories", "conclusions", "preferences", "behaviour", "agent_written_memory"}
+    if table not in tables_with_embeddings and table != "users":
+        return []
+    conn = get_db()
+
+    if table == "users":
+        like = f"%{query_text}%"
+        rows = conn.execute(
+            """SELECT * FROM users WHERE workspace_id=? AND
+               (name LIKE ? OR occupation LIKE ? OR interests LIKE ? OR
+                education LIKE ? OR location LIKE ? OR username LIKE ?)
+               LIMIT ?""",
+            (workspace_id, like, like, like, like, like, like, top_n),
+        ).fetchall()
+        return [parse_row(r) for r in rows]
+
+    if query_emb is None:
+        return []
+    q = np.array(query_emb, dtype=np.float32)
+    qn = np.linalg.norm(q)
+    if qn < 1e-10:
+        return []
+    q = q / qn
+    rows = conn.execute(
+        f"SELECT * FROM {table} WHERE workspace_id=? AND embedding IS NOT NULL",
+        (workspace_id,),
+    ).fetchall()
+    scored = []
+    for r in rows:
+        try:
+            emb = json.loads(r["embedding"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(emb) != len(q):
+            continue
+        v = np.array(emb, dtype=np.float32)
+        vn = np.linalg.norm(v)
+        if vn < 1e-10:
+            continue
+        sim = float(np.dot(q, v / vn))
+        scored.append((sim, parse_row(r)))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s[1] for s in scored[:top_n]]
 
 
 def get_hot_memories(workspace_id, limit=40):

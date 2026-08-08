@@ -497,6 +497,59 @@ async def get_hot_memories_endpoint(name: str, limit: int = Query(15)):
     return {"memories": crud.get_hot_memories(ws["id"], limit)}
 
 
+class MemoryTableSearchRequest(BaseModel):
+    table: str = "memories"
+    query: str = ""
+    top_n: int = 10
+
+
+@app.post("/workspace/by-name/{name}/memory-tables/search")
+async def search_memory_table_endpoint(name: str, body: MemoryTableSearchRequest):
+    """Semantic search across one memory table:
+    memories | conclusions | preferences | behaviour | users | agent_written_memory."""
+    ws = crud.get_or_create_workspace(name)
+    q_emb = None
+    if body.query and embedder.is_available():
+        try:
+            q_emb = embedder.embed(body.query[:2000])
+        except Exception:
+            pass
+    results = crud.search_memory_table(ws["id"], body.table, body.query, q_emb, body.top_n)
+    return {"table": body.table, "results": results}
+
+
+class AgentMemoryWriteRequest(BaseModel):
+    content: str
+    memory_type: str = "agent_note"
+    importance: float = 0.6
+    confidence: float = 0.8
+    durability: float = 0.5
+    metadata: dict = {}
+
+
+@app.post("/workspace/by-name/{name}/memory-tables/agent-write")
+async def agent_write_memory(name: str, body: AgentMemoryWriteRequest):
+    """Write a memory authored by the agent into agent_written_memory."""
+    ws = crud.get_or_create_workspace(name)
+    emb = None
+    if body.content and embedder.is_available():
+        try:
+            emb = embedder.embed(body.content[:2000])
+        except Exception:
+            pass
+    return crud.create_agent_written_memory(
+        ws["id"], body.content, body.memory_type, body.importance,
+        body.confidence, body.durability, body.metadata, emb,
+    )
+
+
+@app.get("/workspace/by-name/{name}/memory-tables/agent-write")
+async def agent_list_memory(name: str, limit: int = Query(50)):
+    """List agent-written memories (most recent first)."""
+    ws = crud.get_or_create_workspace(name)
+    return {"memories": crud.list_agent_written_memories(ws["id"], limit)}
+
+
 @app.get("/memories/{memory_id}")
 async def get_memory(memory_id: str):
     """Get a single memory by ID."""
