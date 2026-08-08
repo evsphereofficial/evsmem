@@ -748,7 +748,7 @@ def get_memory(memory_id):
     return parse_row(row)
 
 
-def get_hot_memories(workspace_id, limit=8):
+def get_hot_memories(workspace_id, limit=15):
     """Get hot memories (type='hot_memory') — always-injected.
     Ranked by importance x durability (newest tiebreak) and capped to `limit`
     so the system prompt doesn't balloon with tokens."""

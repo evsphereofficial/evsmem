@@ -67,7 +67,7 @@ Required JSON schema:
 }}
 
 Detailed rules:
-1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). LIMIT HOT_MEMORIES TO AT MOST 3 per message — only genuinely critical, identity/project-level facts. These are always injected into context.
+1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints, key relationships, recurring behaviors. Keep them short, precise, high importance (0.8-1.0). LIMIT HOT_MEMORIES TO AT MOST 5 per message — only genuinely critical, identity/project/behavior-level facts. These are always injected into context.
 2. COLD_MEMORIES = everything else worth keeping. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail: the project being built, the task, the topic, the code/architecture/approach, what the user wants and the specifics around it. Include technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. Do not just record "user wants X" — record what X is, why, and the surrounding detail.
 3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
 4. Per-memory attributes:
@@ -112,25 +112,25 @@ class Deriver:
     # ── Cursor-based message tracking ──
 
     def _get_unprocessed_messages(self) -> list[dict]:
-        """Get unprocessed user messages using the per-row is_processed flag.
+        """Get unprocessed messages using the per-row is_processed flag.
 
-        Only messages created within the last 7 days AND older than 60 seconds
-        are considered — so assistant streams have settled and old/restored
-        history is never LLM-processed. (Raw storage is instant; this only
-        gates the LLM analysis.)
+        Only messages created within a short lookback window (default 24h) AND
+        older than 30 seconds are considered — so the deriver handles LIVE
+        messages and never re-processes old backlog/history.
         """
+        lookback_hours = int(os.getenv("EVSMEM_PROCESS_LOOKBACK_HOURS", "24"))
         conn = get_db()
         try:
             rows = conn.execute(
-                """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
-                          s.workspace_id, m.metadata
-                   FROM messages m
-                   JOIN sessions s ON m.session_id = s.id
-                   WHERE m.is_processed = 0 AND m.content != ''
-                     AND m.created_at >= datetime('now', '-7 days')
-                     AND m.created_at <= datetime('now', '-30 seconds')
-                   ORDER BY m.rowid DESC
-                   LIMIT 20""",
+                f"""SELECT m.rowid, m.id, m.content, m.role, m.session_id,
+                           s.workspace_id, m.metadata
+                    FROM messages m
+                    JOIN sessions s ON m.session_id = s.id
+                    WHERE m.is_processed = 0 AND m.content != ''
+                      AND m.created_at >= strftime('%Y-%m-%dT%H:%M:%f', 'now', '-{lookback_hours} hours')
+                      AND m.created_at <= strftime('%Y-%m-%dT%H:%M:%f', 'now', '-30 seconds')
+                    ORDER BY m.rowid DESC
+                    LIMIT 20""",
             ).fetchall()
 
             out = []
@@ -794,7 +794,7 @@ class Deriver:
                 FROM sessions s
                 JOIN messages m ON m.session_id = s.id
                 JOIN peers p ON m.peer_id = p.id
-                WHERE s.created_at > datetime('now', '-30 days') AND p.name != 'user'
+                WHERE s.created_at > strftime('%Y-%m-%dT%H:%M:%f', 'now', '-30 days') AND p.name != 'user'
                 GROUP BY s.id, p.name
             """).fetchall()
 
@@ -987,7 +987,7 @@ class Deriver:
         """Cap the hot-memory pool so the always-injected system prompt stays small.
         If more than EVSMEM_HOT_CAP hot memories exist, demote the lowest-scored
         ones (importance x durability) to cold_memory."""
-        cap = int(os.getenv("EVSMEM_HOT_CAP", "30"))
+        cap = int(os.getenv("EVSMEM_HOT_CAP", "50"))
         conn = get_db()
         try:
             rows = conn.execute(
@@ -1011,6 +1011,26 @@ class Deriver:
         finally:
             conn.close()
 
+    def _write_hot_memories_json(self):
+        """Write the top hot memories to ~/.evsmem/hot_memories.json so the
+        ev-agent system prompt can inject them (same pattern as
+        recommendations.json). Capped to 8, ranked by importance x durability."""
+        try:
+            conn = get_db()
+            rows = conn.execute(
+                "SELECT content, importance FROM memories WHERE type='hot_memory' "
+                "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 15"
+            ).fetchall()
+            conn.close()
+            items = [{"content": r["content"], "importance": r["importance"]} for r in rows]
+            payload = {
+                "memories": items,
+                "instruction": "These are hot memories — always-relevant facts about the user, injected every session.",
+            }
+            (Path.home() / ".evsmem" / "hot_memories.json").write_text(json.dumps(payload, indent=2))
+        except Exception as e:
+            logger.warning(f"[hot] Failed to write hot_memories.json: {e}")
+
     def run_once(self) -> int:
         """Sync ev-agent sessions to evsmem, process with LLM, then analyze."""
         synced = self._sync_ev_sessions()
@@ -1030,6 +1050,10 @@ class Deriver:
             self._prune_hot_memories()
         except Exception as e:
             logger.warning(f"Hot-memory prune error: {e}")
+        try:
+            self._write_hot_memories_json()
+        except Exception as e:
+            logger.warning(f"Hot-memory JSON write error: {e}")
         return synced
 
     def run_forever(self):
