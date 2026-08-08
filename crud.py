@@ -1,6 +1,6 @@
 """SQLite CRUD operations for evsmem."""
 
-import json, re, sqlite3, threading
+import json, re, sqlite3, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -10,16 +10,51 @@ DB_PATH = APP_DIR / "evsmem.db"
 
 _local = threading.local()
 
+# Process-wide schema guard — _init_schema performs writes (CREATE TABLE +
+# a conclusions dedup DELETE), so it must run ONCE per process, not on every
+# new thread connection, or concurrent threads hit "database is locked".
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = False
+
+
+def ensure_schema(conn=None):
+    """Run _init_schema exactly once per process (thread-safe). Retries if a
+    concurrent writer briefly holds the DB lock."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        if conn is None:
+            conn = get_db()
+        last_err = None
+        for _ in range(20):
+            try:
+                _init_schema(conn)
+                _SCHEMA_READY = True
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e):
+                    raise
+                last_err = e
+                time.sleep(0.5)
+        if last_err:
+            raise last_err
+
 
 def get_db():
     if not hasattr(_local, "conn") or _local.conn is None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(DB_PATH), timeout=30)
         conn.row_factory = sqlite3.Row
+        # busy_timeout MUST be set before any statement that can take a write
+        # lock (journal_mode/executescript), or those fail instantly with
+        # "database is locked".
+        conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
-        _init_schema(conn)
+        ensure_schema(conn)
         _local.conn = conn
     return _local.conn
 

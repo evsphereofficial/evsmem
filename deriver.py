@@ -110,17 +110,20 @@ def _is_workflow_noise(text):
     return any(p in low for p in patterns)
 
 
-# Run crud._init_schema at most once per process (it performs writes that would
-# otherwise cause "database is locked" contention on every connection).
-_SCHEMA_READY = False
+# The full evsmem schema is ensured ONCE per process via crud.ensure_schema()
+# (thread-safe, shared with crud.get_db) — _init_schema performs writes that
+# would otherwise cause "database is locked" contention on every connection.
 
 
 def get_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
+    # busy_timeout MUST be set before any statement that can take a write lock
+    # (journal_mode / CREATE TABLE / ALTER), or those fail instantly with
+    # "database is locked" under concurrent writers.
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS deriver_state (
@@ -135,17 +138,12 @@ def get_db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE messages ADD COLUMN is_processed INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
-    # Ensure the full evsmem schema exists ONCE per process (crud._init_schema is
-    # idempotent but performs writes, so running it on every connection causes
-    # "database is locked" contention).
-    global _SCHEMA_READY
-    if not _SCHEMA_READY:
-        try:
-            import crud as _crud
-            _crud._init_schema(conn)
-            _SCHEMA_READY = True
-        except Exception:
-            pass
+    # Ensure the full evsmem schema exists ONCE per process (shared guard).
+    try:
+        import crud as _crud
+        _crud.ensure_schema(conn)
+    except Exception:
+        pass
     return conn
 
 
