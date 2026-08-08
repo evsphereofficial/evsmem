@@ -1101,15 +1101,35 @@ def search_memory_table(workspace_id, table, query_text="", query_emb=None, top_
         ).fetchall()
         return [parse_row(r) for r in rows]
 
+    # conclusions has NO workspace_id column — filter via the sessions join.
+    if table == "conclusions":
+        from_sql = "FROM conclusions c JOIN sessions s ON c.session_id = s.id"
+        workspace_where = "s.workspace_id=?"
+        embed_where = "c.embedding IS NOT NULL"
+        order_col = "c.created_at"
+        star = "c.*"
+    else:
+        from_sql = f"FROM {table}"
+        workspace_where = "workspace_id=?"
+        embed_where = "embedding IS NOT NULL"
+        order_col = "created_at"
+        star = "*"
+
     if query_emb is None:
-        return []
+        # No query embedding available → fall back to the most recent rows so
+        # read_memory(table=X) still returns something.
+        rows = conn.execute(
+            f"SELECT {star} {from_sql} WHERE {workspace_where} ORDER BY {order_col} DESC LIMIT ?",
+            (workspace_id, top_n),
+        ).fetchall()
+        return [parse_row(r) for r in rows]
     q = np.array(query_emb, dtype=np.float32)
     qn = np.linalg.norm(q)
     if qn < 1e-10:
         return []
     q = q / qn
     rows = conn.execute(
-        f"SELECT * FROM {table} WHERE workspace_id=? AND embedding IS NOT NULL",
+        f"SELECT {star} {from_sql} WHERE {workspace_where} AND {embed_where}",
         (workspace_id,),
     ).fetchall()
     scored = []
