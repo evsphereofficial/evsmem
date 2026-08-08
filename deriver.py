@@ -1012,14 +1012,20 @@ class Deriver:
             conn.close()
 
     def _write_hot_memories_json(self):
-        """Write the top hot memories to ~/.evsmem/hot_memories.json so the
-        ev-agent system prompt can inject them (same pattern as
-        recommendations.json). Capped to 8, ranked by importance x durability."""
+        """Write hot memories to ~/.evsmem/hot_memories.json so the ev-agent
+        system prompt can inject them (same pattern as recommendations.json).
+        Includes up to 100 hot memories with USER info/behavior facts FIRST
+        (so every user fact gets injected); project/other facts fill the rest."""
         try:
             conn = get_db()
             rows = conn.execute(
-                "SELECT content, importance FROM memories WHERE type='hot_memory' "
-                "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 40"
+                """SELECT content, importance, memory_type FROM memories
+                   WHERE type='hot_memory'
+                   ORDER BY
+                     CASE WHEN memory_type IN ('user','preference','mood','relationship','behavior') THEN 0 ELSE 1 END,
+                     (importance * COALESCE(durability, 0.5)) DESC,
+                     created_at DESC
+                   LIMIT 100"""
             ).fetchall()
             conn.close()
             items = [{"content": r["content"], "importance": r["importance"]} for r in rows]
