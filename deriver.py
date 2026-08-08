@@ -51,7 +51,8 @@ Message: "{content}"
 
 Required JSON schema:
 {{
-  "user_name": "exact user name if stated, else null",
+  "user": {{"name": "extracted user name or null", "age": "extracted age or null", "location": "extracted location or null"}},
+  "user_name": "extracted name or null",
   "user_mood": "detected mood (happy/frustrated/neutral/urgent/etc) or null",
   "user_preferences": ["concrete stated preference 1", "preference 2"],
   "hot_memories": [
@@ -111,6 +112,14 @@ def get_db() -> sqlite3.Connection:
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN is_processed INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
+        pass
+    # Ensure the full evsmem schema exists (workspaces, sessions, peers, messages,
+    # memories, behaviour, preferences, rules, users, ...) — crud._init_schema is
+    # idempotent (CREATE TABLE IF NOT EXISTS) and safe to run on this connection.
+    try:
+        import crud as _crud
+        _crud._init_schema(conn)
+    except Exception:
         pass
     return conn
 
@@ -314,8 +323,25 @@ class Deriver:
         self._store_llm_conclusions(parsed, session_id)
         self._store_llm_memories(parsed, workspace_id, session_id)
         self._store_llm_classified(parsed, workspace_id, session_id)
+        self._store_user_info(parsed, workspace_id)
         self._update_peer_from_llm(parsed, workspace_id)
         self._store_agent_assessment(parsed, workspace_id)
+
+    def _store_user_info(self, parsed: dict, workspace_id: str):
+        """Upsert structured user info (name/age/location) into the users table."""
+        user = parsed.get("user")
+        if not user or not isinstance(user, dict):
+            return
+        name = str(user.get("name") or "").strip()
+        age = str(user.get("age") or "").strip()
+        location = str(user.get("location") or "").strip()
+        if not name and not age and not location:
+            return
+        import crud as _crud
+        try:
+            _crud.upsert_user(workspace_id, name=name or None, age=age or None, location=location or None)
+        except Exception as e:
+            logger.debug(f"Failed to store user info: {e}")
 
     def _store_llm_classified(self, parsed: dict, workspace_id: str, session_id: str):
         """Store behaviours / preferences / rules into their dedicated tables
@@ -1082,16 +1108,17 @@ class Deriver:
             wid = ws["id"] if ws else None
 
             beh, pref, rules, hot = [], [], [], []
+            user = {}
             if wid:
                 beh = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
                     "SELECT content, importance FROM behaviour WHERE workspace_id=? "
-                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC", (wid,)).fetchall()]
                 pref = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
                     "SELECT content, importance FROM preferences WHERE workspace_id=? "
-                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC", (wid,)).fetchall()]
                 rules = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
                     "SELECT content, importance FROM rules WHERE workspace_id=? "
-                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC", (wid,)).fetchall()]
                 hot = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
                     """SELECT content, importance, memory_type FROM memories
                        WHERE workspace_id=? AND type='hot_memory'
@@ -1101,9 +1128,17 @@ class Deriver:
                          created_at DESC
                        LIMIT 100""",
                     (wid,)).fetchall()]
+                u = conn.execute("SELECT name, age, location FROM users WHERE workspace_id=?", (wid,)).fetchone()
+                if u:
+                    user = {
+                        "name": u["name"] or "",
+                        "age": u["age"] or "",
+                        "location": u["location"] or "",
+                    }
             conn.close()
 
             payload = {
+                "user": user,
                 "behaviours": beh,
                 "preferences": pref,
                 "rules": rules,

@@ -190,6 +190,19 @@ def _init_schema(conn):
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            name TEXT DEFAULT '',
+            age TEXT DEFAULT '',
+            location TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            email TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(workspace_id)
+        );
         CREATE TABLE IF NOT EXISTS reputation (
             id TEXT PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -791,8 +804,10 @@ def get_memory(memory_id):
 
 
 def _store_classified(table, workspace_id, content, mem_type, importance, confidence,
-                     durability, source='deriver_llm', metadata=None, embedding=None, cap=30):
-    """Dedup + capped insert into behaviour / preferences / rules tables."""
+                     durability, source='deriver_llm', metadata=None, embedding=None, cap=100):
+    """Dedup + capped insert into behaviour / preferences / rules tables.
+    Rows beyond the cap are DEMOTED to the memories table (as cold_memory)
+    instead of being deleted, so nothing is ever lost."""
     conn = get_db()
     existing = conn.execute(
         f"SELECT id FROM {table} WHERE workspace_id=? AND lower(trim(content))=lower(trim(?))",
@@ -809,37 +824,52 @@ def _store_classified(table, workspace_id, content, mem_type, importance, confid
         (mid, workspace_id, content, mem_type, importance, confidence, durability, source,
          json.dumps(metadata or {}), emb_json, _ts(), _ts()),
     )
-    conn.execute(
-        f"""DELETE FROM {table}
-           WHERE workspace_id=? AND id NOT IN (
-               SELECT id FROM {table} WHERE workspace_id=?
-               ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC
-               LIMIT ?)""",
-        (workspace_id, workspace_id, cap),
-    )
+    # Demote excess rows (over cap) into memories as cold_memory instead of deleting.
+    excess = conn.execute(
+        f"""SELECT id, content, importance, confidence, durability, metadata FROM {table}
+            WHERE workspace_id=?
+            ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC
+            LIMIT -1 OFFSET ?""",
+        (workspace_id, cap),
+    ).fetchall()
+    for row in excess:
+        try:
+            conn.execute(
+                """INSERT INTO memories
+                   (id, workspace_id, user_id, agent_name, type, memory_type, content,
+                    embedding, importance, confidence, durability, observed_count, source,
+                    metadata, created_at, updated_at)
+                   VALUES (?, ?, '', '', 'cold_memory', ?, ?, NULL, ?, ?, ?, 1, 'demoted', ?, ?, ?)""",
+                (_uuid(), workspace_id, mem_type, row["content"],
+                 row["importance"], row["confidence"], row["durability"],
+                 row["metadata"] or '{}', _ts(), _ts()),
+            )
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
+        except Exception:
+            pass
     conn.commit()
     return conn.execute(f"SELECT * FROM {table} WHERE id=?", (mid,)).fetchone()
 
 
 def create_behaviour(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
-                     metadata=None, embedding=None, cap=30):
+                     metadata=None, embedding=None, cap=100):
     return _store_classified("behaviour", workspace_id, content, "behaviour", importance,
                              confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
 
 
 def create_preference(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
-                      metadata=None, embedding=None, cap=30):
+                      metadata=None, embedding=None, cap=100):
     return _store_classified("preferences", workspace_id, content, "preference", importance,
                              confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
 
 
 def create_rule(workspace_id, content, importance=1.0, confidence=0.9, durability=0.95,
-                metadata=None, embedding=None, cap=30):
+                metadata=None, embedding=None, cap=100):
     return _store_classified("rules", workspace_id, content, "rule", importance,
                              confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
 
 
-def list_classified(table, workspace_id, limit=30):
+def list_classified(table, workspace_id, limit=100):
     conn = get_db()
     return [parse_row(r) for r in conn.execute(
         f"SELECT * FROM {table} WHERE workspace_id=? "
@@ -848,16 +878,46 @@ def list_classified(table, workspace_id, limit=30):
     ).fetchall()]
 
 
-def get_behaviours(workspace_id, limit=30):
+def get_behaviours(workspace_id, limit=100):
     return list_classified("behaviour", workspace_id, limit)
 
 
-def get_preferences(workspace_id, limit=30):
+def get_preferences(workspace_id, limit=100):
     return list_classified("preferences", workspace_id, limit)
 
 
-def get_rules(workspace_id, limit=30):
+def get_rules(workspace_id, limit=100):
     return list_classified("rules", workspace_id, limit)
+
+
+def upsert_user(workspace_id, name=None, age=None, location=None, username=None, metadata=None):
+    """Create or update the single user row for a workspace. Existing non-empty
+    fields are preserved when the new value is empty."""
+    conn = get_db()
+    existing = conn.execute("SELECT id FROM users WHERE workspace_id=?", (workspace_id,)).fetchone()
+    uid = existing["id"] if existing else _uuid()
+    meta_json = json.dumps(metadata or {})
+    conn.execute(
+        """INSERT INTO users (id, workspace_id, name, age, location, username, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(workspace_id) DO UPDATE SET
+             name = CASE WHEN excluded.name != '' THEN excluded.name ELSE users.name END,
+             age = CASE WHEN excluded.age != '' THEN excluded.age ELSE users.age END,
+             location = CASE WHEN excluded.location != '' THEN excluded.location ELSE users.location END,
+             username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+             metadata = excluded.metadata,
+             updated_at = excluded.updated_at""",
+        (uid, workspace_id, name or '', age or '', location or '', username or '',
+         meta_json, _ts(), _ts()),
+    )
+    conn.commit()
+    return get_user(workspace_id)
+
+
+def get_user(workspace_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE workspace_id=?", (workspace_id,)).fetchone()
+    return parse_row(row) if row else None
 
 
 def get_hot_memories(workspace_id, limit=40):
