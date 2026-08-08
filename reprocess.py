@@ -23,8 +23,8 @@ from pathlib import Path
 
 # GPU-safety defaults (12GB VRAM): 12B Q4 model ~7GB weights + KV cache + BGE-M3.
 # Do NOT raise these on a 12GB card or the machine will OOM.
-os.environ.setdefault("LLM_N_CTX", "8192")
-os.environ.setdefault("LLM_MAX_TOKENS", "4096")
+os.environ.setdefault("LLM_N_CTX", "4096")
+os.environ.setdefault("LLM_MAX_TOKENS", "2048")
 # If it still OOMs, also set: LLM_GPU_LAYERS=20  (offloads most layers to CPU, slower but safe)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
