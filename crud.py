@@ -748,12 +748,14 @@ def get_memory(memory_id):
     return parse_row(row)
 
 
-def get_hot_memories(workspace_id, limit=15):
-    """Get hot memories (type='hot_memory') — always-injected, highest importance first."""
+def get_hot_memories(workspace_id, limit=8):
+    """Get hot memories (type='hot_memory') — always-injected.
+    Ranked by importance x durability (newest tiebreak) and capped to `limit`
+    so the system prompt doesn't balloon with tokens."""
     conn = get_db()
     return [parse_row(r) for r in conn.execute(
         "SELECT * FROM memories WHERE workspace_id=? AND type='hot_memory' "
-        "ORDER BY importance DESC, created_at DESC LIMIT ?",
+        "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT ?",
         (workspace_id, limit),
     ).fetchall()]
 

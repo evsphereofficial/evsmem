@@ -67,7 +67,7 @@ Required JSON schema:
 }}
 
 Detailed rules:
-1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). These are always injected into context.
+1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). LIMIT HOT_MEMORIES TO AT MOST 3 per message — only genuinely critical, identity/project-level facts. These are always injected into context.
 2. COLD_MEMORIES = everything else worth keeping. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail: the project being built, the task, the topic, the code/architecture/approach, what the user wants and the specifics around it. Include technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. Do not just record "user wants X" — record what X is, why, and the surrounding detail.
 3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
 4. Per-memory attributes:
@@ -983,6 +983,34 @@ class Deriver:
         finally:
             conn.close()
 
+    def _prune_hot_memories(self):
+        """Cap the hot-memory pool so the always-injected system prompt stays small.
+        If more than EVSMEM_HOT_CAP hot memories exist, demote the lowest-scored
+        ones (importance x durability) to cold_memory."""
+        cap = int(os.getenv("EVSMEM_HOT_CAP", "30"))
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM memories WHERE type='hot_memory' "
+                "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC"
+            ).fetchall()
+            if len(rows) <= cap:
+                return
+            excess = [r["id"] for r in rows[cap:]]
+            for mid in excess:
+                conn.execute(
+                    "UPDATE memories SET type='cold_memory', "
+                    "metadata=json_set(COALESCE(metadata,'{}'), '$.tier', 'cold_memory', '$.demoted_from_hot', 'true') "
+                    "WHERE id=?",
+                    (mid,),
+                )
+            conn.commit()
+            logger.info(f"[hot] Demoted {len(excess)} low-value hot memories to cold")
+        except Exception as e:
+            logger.warning(f"[hot] Prune error: {e}")
+        finally:
+            conn.close()
+
     def run_once(self) -> int:
         """Sync ev-agent sessions to evsmem, process with LLM, then analyze."""
         synced = self._sync_ev_sessions()
@@ -998,6 +1026,10 @@ class Deriver:
             self._check_auto_generate_trigger()
         except Exception as e:
             logger.warning(f"Auto-generate trigger error: {e}")
+        try:
+            self._prune_hot_memories()
+        except Exception as e:
+            logger.warning(f"Hot-memory prune error: {e}")
         return synced
 
     def run_forever(self):
