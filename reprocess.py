@@ -51,7 +51,7 @@ def load_unprocessed(limit=0):
     conn.row_factory = sqlite3.Row
     sql = """SELECT m.rowid, m.id, m.content, m.role, m.session_id, s.workspace_id
              FROM messages m JOIN sessions s ON m.session_id = s.id
-             WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
+             WHERE m.is_processed = 0 AND m.content != ''
              ORDER BY m.rowid DESC"""
     if limit > 0:
         sql += f" LIMIT {limit}"

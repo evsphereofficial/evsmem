@@ -68,7 +68,7 @@ Required JSON schema:
 
 Detailed rules:
 1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). These are always injected into context.
-2. COLD_MEMORIES = everything else worth keeping: specific technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned, anything the user might ask about later. Be DETAILED — include project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact is useful alone.
+2. COLD_MEMORIES = everything else worth keeping. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail: the project being built, the task, the topic, the code/architecture/approach, what the user wants and the specifics around it. Include technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. Do not just record "user wants X" — record what X is, why, and the surrounding detail.
 3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
 4. importance scale: 0.0 (trivial) to 1.0 (must-never-forget). Use 0.8-1.0 for hot, 0.3-0.7 for cold.
 5. If the message has no memorable facts, output empty arrays: "hot_memories": [], "cold_memories": [], "conclusions": [].
@@ -122,10 +122,10 @@ class Deriver:
                           s.workspace_id, m.metadata
                    FROM messages m
                    JOIN sessions s ON m.session_id = s.id
-                   WHERE m.is_processed = 0 AND m.role = 'user' AND m.content != ''
+                   WHERE m.is_processed = 0 AND m.content != ''
                      AND m.created_at >= datetime('now', '-7 days')
-                     AND m.created_at <= datetime('now', '-60 seconds')
-                   ORDER BY m.rowid ASC
+                     AND m.created_at <= datetime('now', '-30 seconds')
+                   ORDER BY m.rowid DESC
                    LIMIT 20""",
             ).fetchall()
 
@@ -212,6 +212,7 @@ class Deriver:
             if idx != -1:
                 content = content[idx+2:].strip()
 
+        role = msg.get("role", "user")
         if msg.get("is_subagent"):
             content = (
                 "[NOTE: This message is from an INTERNAL SUBAGENT session (an AI subagent working a task), "
@@ -219,11 +220,19 @@ class Deriver:
                 "identity, or mood from it. Only extract concrete technical/project facts if clearly present.]\n"
                 + content
             )
+        elif role == "assistant":
+            content = (
+                "[NOTE: This is the AI ASSISTANT's response in the conversation. It contains the DETAILED "
+                "technical/project context of what the user is working on. Extract the facts about what is being "
+                "built and discussed IN DETAIL. Do NOT attribute these statements as the human user's own "
+                "words or preferences.]\n"
+                + content
+            )
 
         if len(content) < 10:
             return None
 
-        prompt = LLM_ANALYSIS_PROMPT.format(content=content[:2000])
+        prompt = LLM_ANALYSIS_PROMPT.format(content=content[:6000])
 
         raw = llm.generate(
             messages=[{"role": "user", "content": prompt}],
