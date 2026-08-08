@@ -62,21 +62,34 @@ Required JSON schema:
     {{"content": "a DETAILED, specific fact: include names, projects, versions, decisions, code paths, and enough context (2-3 sentences) to stand alone", "importance": 0.5, "confidence": 0.8, "durability": 0.5, "type": "project"}},
     {{"content": "another detailed fact retrievable on request", "importance": 0.4, "confidence": 0.7, "durability": 0.3, "type": "event"}}
   ],
+  "behaviours": [
+    {{"content": "a recurring behavior pattern of the user", "importance": 0.9}},
+    {{"content": "another recurring behavior pattern", "importance": 0.85}}
+  ],
+  "preferences": [
+    {{"content": "a stated preference of the user", "importance": 0.9}}
+  ],
+  "rules": [
+    {{"content": "an explicit instruction/rule the user wants followed ALWAYS (e.g. 'make small git commits')", "importance": 1.0}}
+  ],
   "conclusions": ["a new insight about the user or project, phrased uniquely"],
   "agent_assessment": {{"agent_name": "mentioned agent or ''", "verdict": "positive|negative|neutral", "detail": "one-line assessment"}}
 }}
 
 Detailed rules:
-1. HOT_MEMORIES = EVERY user info and behavior fact: identity (name, age, location), preferences, habits, moods, work style, constraints, key relationships, recurring behaviors, decisions the user makes about themselves. These are ALWAYS injected into every session. Include EVERY user info/behavior fact from this message; keep each short, precise, importance 0.8-1.0. Max 8 per message.
-2. COLD_MEMORIES = everything else — the EXTRAS, injected on demand: project/technical details, what the user is building, the task, the topic, the code/architecture/approach, technical decisions, tooling, versions, bugs, design rationale, people/projects mentioned. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. importance 0.3-0.7.
-3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
-4. Per-memory attributes:
-   - importance: 0.0 (trivial) to 1.0 (must-never-forget). Hot 0.8-1.0, cold 0.3-0.7.
-   - confidence: how sure are we this fact is true, 0.0-1.0 (default 0.8).
-   - durability: how long this fact is likely to stay true, 0.0 (transient/debugging detail) to 1.0 (permanent fact). Architecture decisions ~0.9, a failed command ~0.1.
-   - type: one of: user | preference | project | decision | architecture_decision | tooling | environment | event | debugging_event | conversation_insight.
-5. If the message has no memorable facts, output empty arrays: "hot_memories": [], "cold_memories": [], "conclusions": [].
-6. Return ONLY the JSON object. No markdown fences, no commentary."""
+1. BEHAVIOURS = recurring patterns in how the user works/behaves (e.g. "user makes small commits", "user works late", "user prefers to do X before Y"). These are the MOST IMPORTANT — ev-agent must adapt to them. importance 0.8-1.0.
+2. PREFERENCES = stated likes/dislikes/choices (e.g. "user prefers Python over TypeScript", "user prefers dark mode"). importance 0.8-1.0.
+3. RULES = explicit instructions or hard rules the user gave that MUST always be followed (e.g. "never use force delete", "make small git commits to inflate commits", "don't use emojis"). These are CRITICAL — importance 0.95-1.0. Max 5 per message.
+4. HOT_MEMORIES = every user info fact NOT already covered by behaviours/preferences/rules: identity, mood, work style, constraints, relationships, decisions. Always injected. Max 8 per message.
+5. COLD_MEMORIES = everything else — the EXTRAS, injected on demand: project/technical details, what the user is building, the task, the topic, code/architecture/approach, technical decisions, tooling, versions, bugs, design rationale. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail. Be DETAILED — project names, exact terms, versions, file paths, 2-3 sentences of context. importance 0.3-0.7.
+6. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
+7. Per-memory attributes:
+   - importance: 0.0 (trivial) to 1.0 (must-never-forget).
+   - confidence: how sure we are this fact is true, 0.0-1.0 (default 0.8).
+   - durability: how long this fact is likely to stay true, 0.0 (transient) to 1.0 (permanent).
+   - type: user | preference | project | decision | architecture_decision | tooling | environment | event | debugging_event | conversation_insight.
+8. If the message has no memorable facts, output empty arrays for all fields.
+9. Return ONLY the JSON object. No markdown fences, no commentary."""
 
 
 def get_db() -> sqlite3.Connection:
@@ -300,8 +313,53 @@ class Deriver:
 
         self._store_llm_conclusions(parsed, session_id)
         self._store_llm_memories(parsed, workspace_id, session_id)
+        self._store_llm_classified(parsed, workspace_id, session_id)
         self._update_peer_from_llm(parsed, workspace_id)
         self._store_agent_assessment(parsed, workspace_id)
+
+    def _store_llm_classified(self, parsed: dict, workspace_id: str, session_id: str):
+        """Store behaviours / preferences / rules into their dedicated tables
+        (small, capped, always-injected — the most important user-adaptation
+        memory)."""
+        from embeddings import EmbeddingClient
+        _ec = EmbeddingClient()
+        import crud as _crud
+
+        for key, store_fn, mem_type, default_imp in (
+            ("behaviours", _crud.create_behaviour, "behaviour", 0.9),
+            ("preferences", _crud.create_preference, "preference", 0.9),
+            ("rules", _crud.create_rule, "rule", 1.0),
+        ):
+            items = parsed.get(key)
+            if not items or not isinstance(items, list):
+                continue
+            for mem in items:
+                content = mem.get("content") if isinstance(mem, dict) else None
+                if not content or not isinstance(content, str):
+                    continue
+                content = content.strip()
+                if len(content) < 5:
+                    continue
+                importance = float(mem.get("importance", default_imp))
+                try:
+                    emb = None
+                    if _ec.is_available():
+                        try:
+                            emb = _ec.embed(content[:2000])
+                        except Exception:
+                            pass
+                    logger.info(f"Storing {mem_type}: {len(content)} chars")
+                    store_fn(
+                        workspace_id=workspace_id,
+                        content=content,
+                        importance=importance,
+                        confidence=float(mem.get("confidence", 0.9)),
+                        durability=float(mem.get("durability", 0.9)),
+                        metadata={"session_id": session_id},
+                        embedding=emb,
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to store {mem_type}: {e}")
 
     def _store_llm_conclusions(self, parsed: dict, session_id: str):
         """Store derived facts/insights as conclusions via crud."""
@@ -1012,26 +1070,45 @@ class Deriver:
             conn.close()
 
     def _write_hot_memories_json(self):
-        """Write hot memories to ~/.evsmem/hot_memories.json so the ev-agent
-        system prompt can inject them (same pattern as recommendations.json).
-        Includes up to 100 hot memories with USER info/behavior facts FIRST
-        (so every user fact gets injected); project/other facts fill the rest."""
+        """Write behaviours / preferences / rules / hot memories to
+        ~/.evsmem/hot_memories.json so the ev-agent system prompt can inject
+        them (same pattern as recommendations.json). Behavioural memory is the
+        MOST IMPORTANT and always comes first."""
         try:
             conn = get_db()
-            rows = conn.execute(
-                """SELECT content, importance, memory_type FROM memories
-                   WHERE type='hot_memory'
-                   ORDER BY
-                     CASE WHEN memory_type IN ('user','preference','mood','relationship','behavior') THEN 0 ELSE 1 END,
-                     (importance * COALESCE(durability, 0.5)) DESC,
-                     created_at DESC
-                   LIMIT 100"""
-            ).fetchall()
+            ws = conn.execute(
+                "SELECT id FROM workspaces WHERE name='ev-agent' ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            wid = ws["id"] if ws else None
+
+            beh, pref, rules, hot = [], [], [], []
+            if wid:
+                beh = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
+                    "SELECT content, importance FROM behaviour WHERE workspace_id=? "
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                pref = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
+                    "SELECT content, importance FROM preferences WHERE workspace_id=? "
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                rules = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
+                    "SELECT content, importance FROM rules WHERE workspace_id=? "
+                    "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 30", (wid,)).fetchall()]
+                hot = [{"content": r["content"], "importance": r["importance"]} for r in conn.execute(
+                    """SELECT content, importance, memory_type FROM memories
+                       WHERE workspace_id=? AND type='hot_memory'
+                       ORDER BY
+                         CASE WHEN memory_type IN ('user','preference','mood','relationship','behavior') THEN 0 ELSE 1 END,
+                         (importance * COALESCE(durability, 0.5)) DESC,
+                         created_at DESC
+                       LIMIT 100""",
+                    (wid,)).fetchall()]
             conn.close()
-            items = [{"content": r["content"], "importance": r["importance"]} for r in rows]
+
             payload = {
-                "memories": items,
-                "instruction": "These are hot memories — always-relevant facts about the user, injected every session.",
+                "behaviours": beh,
+                "preferences": pref,
+                "rules": rules,
+                "memories": hot,
+                "instruction": "Behavioural memory is the MOST IMPORTANT — adapt to the user's behaviour, preferences, and rules above all else.",
             }
             (Path.home() / ".evsmem" / "hot_memories.json").write_text(json.dumps(payload, indent=2))
         except Exception as e:

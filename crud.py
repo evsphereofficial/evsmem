@@ -148,6 +148,48 @@ def _init_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_memories_workspace_type ON memories(workspace_id, type);
         CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(workspace_id, user_id);
         CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(workspace_id, agent_name);
+        CREATE TABLE IF NOT EXISTS behaviour (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            content TEXT NOT NULL,
+            type TEXT DEFAULT 'behaviour',
+            importance REAL DEFAULT 0.9,
+            confidence REAL DEFAULT 0.8,
+            durability REAL DEFAULT 0.9,
+            source TEXT DEFAULT 'deriver_llm',
+            metadata TEXT DEFAULT '{}',
+            embedding TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS preferences (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            content TEXT NOT NULL,
+            type TEXT DEFAULT 'preference',
+            importance REAL DEFAULT 0.9,
+            confidence REAL DEFAULT 0.8,
+            durability REAL DEFAULT 0.9,
+            source TEXT DEFAULT 'deriver_llm',
+            metadata TEXT DEFAULT '{}',
+            embedding TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS rules (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            content TEXT NOT NULL,
+            type TEXT DEFAULT 'rule',
+            importance REAL DEFAULT 1.0,
+            confidence REAL DEFAULT 0.9,
+            durability REAL DEFAULT 0.95,
+            source TEXT DEFAULT 'deriver_llm',
+            metadata TEXT DEFAULT '{}',
+            embedding TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS reputation (
             id TEXT PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -746,6 +788,76 @@ def get_memory(memory_id):
     if not row:
         return None
     return parse_row(row)
+
+
+def _store_classified(table, workspace_id, content, mem_type, importance, confidence,
+                     durability, source='deriver_llm', metadata=None, embedding=None, cap=30):
+    """Dedup + capped insert into behaviour / preferences / rules tables."""
+    conn = get_db()
+    existing = conn.execute(
+        f"SELECT id FROM {table} WHERE workspace_id=? AND lower(trim(content))=lower(trim(?))",
+        (workspace_id, content),
+    ).fetchone()
+    if existing:
+        return conn.execute(f"SELECT * FROM {table} WHERE id=?", (existing["id"],)).fetchone()
+    mid = _uuid()
+    emb_json = json.dumps(embedding) if embedding else None
+    conn.execute(
+        f"""INSERT INTO {table}
+           (id, workspace_id, content, type, importance, confidence, durability, source, metadata, embedding, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mid, workspace_id, content, mem_type, importance, confidence, durability, source,
+         json.dumps(metadata or {}), emb_json, _ts(), _ts()),
+    )
+    conn.execute(
+        f"""DELETE FROM {table}
+           WHERE workspace_id=? AND id NOT IN (
+               SELECT id FROM {table} WHERE workspace_id=?
+               ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC
+               LIMIT ?)""",
+        (workspace_id, workspace_id, cap),
+    )
+    conn.commit()
+    return conn.execute(f"SELECT * FROM {table} WHERE id=?", (mid,)).fetchone()
+
+
+def create_behaviour(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
+                     metadata=None, embedding=None, cap=30):
+    return _store_classified("behaviour", workspace_id, content, "behaviour", importance,
+                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+
+
+def create_preference(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
+                      metadata=None, embedding=None, cap=30):
+    return _store_classified("preferences", workspace_id, content, "preference", importance,
+                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+
+
+def create_rule(workspace_id, content, importance=1.0, confidence=0.9, durability=0.95,
+                metadata=None, embedding=None, cap=30):
+    return _store_classified("rules", workspace_id, content, "rule", importance,
+                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+
+
+def list_classified(table, workspace_id, limit=30):
+    conn = get_db()
+    return [parse_row(r) for r in conn.execute(
+        f"SELECT * FROM {table} WHERE workspace_id=? "
+        "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT ?",
+        (workspace_id, limit),
+    ).fetchall()]
+
+
+def get_behaviours(workspace_id, limit=30):
+    return list_classified("behaviour", workspace_id, limit)
+
+
+def get_preferences(workspace_id, limit=30):
+    return list_classified("preferences", workspace_id, limit)
+
+
+def get_rules(workspace_id, limit=30):
+    return list_classified("rules", workspace_id, limit)
 
 
 def get_hot_memories(workspace_id, limit=40):
