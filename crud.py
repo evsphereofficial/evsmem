@@ -803,25 +803,35 @@ def get_memory(memory_id):
     return parse_row(row)
 
 
+def _norm(text):
+    """Normalize text for dedup: lowercase, strip trailing punctuation, collapse whitespace."""
+    t = re.sub(r"[.!?]+$", "", (text or "").strip().lower())
+    return re.sub(r"\s+", " ", t)
+
+
 def _store_classified(table, workspace_id, content, mem_type, importance, confidence,
                      durability, source='deriver_llm', metadata=None, embedding=None, cap=100):
-    """Dedup + capped insert into behaviour / preferences / rules tables.
+    """Dedup (normalized + fuzzy) + capped insert into behaviour / preferences / rules tables.
     Rows beyond the cap are DEMOTED to the memories table (as cold_memory)
     instead of being deleted, so nothing is ever lost."""
     conn = get_db()
+    norm = _norm(content)
     existing = conn.execute(
-        f"SELECT id FROM {table} WHERE workspace_id=? AND lower(trim(content))=lower(trim(?))",
-        (workspace_id, content),
-    ).fetchone()
-    if existing:
-        return conn.execute(f"SELECT * FROM {table} WHERE id=?", (existing["id"],)).fetchone()
+        f"SELECT id, content FROM {table} WHERE workspace_id=?",
+        (workspace_id,),
+    ).fetchall()
+    import difflib
+    for r in existing:
+        r_norm = _norm(r["content"])
+        if r_norm == norm or difflib.SequenceMatcher(None, r_norm, norm).ratio() >= 0.85:
+            return conn.execute(f"SELECT * FROM {table} WHERE id=?", (r["id"],)).fetchone()
     mid = _uuid()
     emb_json = json.dumps(embedding) if embedding else None
     conn.execute(
         f"""INSERT INTO {table}
            (id, workspace_id, content, type, importance, confidence, durability, source, metadata, embedding, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (mid, workspace_id, content, mem_type, importance, confidence, durability, source,
+        (mid, workspace_id, norm, mem_type, importance, confidence, durability, source,
          json.dumps(metadata or {}), emb_json, _ts(), _ts()),
     )
     # Demote excess rows (over cap) into memories as cold_memory instead of deleting.
@@ -849,6 +859,51 @@ def _store_classified(table, workspace_id, content, mem_type, importance, confid
             pass
     conn.commit()
     return conn.execute(f"SELECT * FROM {table} WHERE id=?", (mid,)).fetchone()
+
+
+def dedup_classified(table, workspace_id):
+    """Sweep near-duplicate rows in a classified table: keep the best of each
+    group, DEMOTE the rest into memories (cold_memory) and delete them.
+    Returns the number of duplicates removed."""
+    conn = get_db()
+    rows = conn.execute(
+        f"""SELECT id, content, importance, confidence, durability, metadata FROM {table}
+            WHERE workspace_id=?
+            ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at ASC""",
+        (workspace_id,),
+    ).fetchall()
+    import difflib
+    keep = []
+    demote = []
+    for r in rows:
+        norm = _norm(r["content"])
+        is_dup = False
+        for k in keep:
+            k_norm = _norm(k["content"])
+            if k_norm == norm or difflib.SequenceMatcher(None, k_norm, norm).ratio() >= 0.85:
+                is_dup = True
+                break
+        if is_dup:
+            demote.append(r)
+        else:
+            keep.append(r)
+    for row in demote:
+        try:
+            conn.execute(
+                """INSERT INTO memories
+                   (id, workspace_id, user_id, agent_name, type, memory_type, content,
+                    embedding, importance, confidence, durability, observed_count, source,
+                    metadata, created_at, updated_at)
+                   VALUES (?, ?, '', '', 'cold_memory', ?, ?, NULL, ?, ?, ?, 1, 'demoted_duplicate', ?, ?, ?)""",
+                (_uuid(), workspace_id, "classified", row["content"],
+                 row["importance"], row["confidence"], row["durability"],
+                 row["metadata"] or '{}', _ts(), _ts()),
+            )
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
+        except Exception:
+            pass
+    conn.commit()
+    return len(demote)
 
 
 def create_behaviour(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,

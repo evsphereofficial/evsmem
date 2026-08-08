@@ -457,6 +457,26 @@ class Deriver:
             ("memories", "conversation_insight", 0.5),
         )
 
+        # Load existing memory contents once (recent 300) for normalized + fuzzy dedup.
+        def _norm(t):
+            import re as _re
+            s = _re.sub(r"[.!?]+$", "", (t or "").strip().lower())
+            return _re.sub(r"\s+", " ", s)
+
+        existing_contents = []
+        try:
+            dconn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
+            existing_contents = [r[0] for r in dconn.execute(
+                "SELECT content FROM memories WHERE workspace_id=? "
+                "ORDER BY created_at DESC LIMIT 300",
+                (workspace_id,),
+            ).fetchall()]
+            dconn.close()
+        except Exception:
+            pass
+
+        import difflib
+
         for key, mem_type, default_imp in tiers:
             items = parsed.get(key)
             if not items or not isinstance(items, list):
@@ -474,19 +494,18 @@ class Deriver:
                 ):
                     continue
 
-                # Exact-content dedup: skip if this memory already exists for the workspace
-                try:
-                    dconn = sqlite3.connect(str(Path.home() / ".evsmem" / "evsmem.db"))
-                    dup = dconn.execute(
-                        "SELECT 1 FROM memories WHERE workspace_id=? AND lower(trim(content))=lower(trim(?)) LIMIT 1",
-                        (workspace_id, content),
-                    ).fetchone()
-                    dconn.close()
-                    if dup:
-                        logger.info(f"Duplicate memory skipped: {len(content)} chars")
-                        continue
-                except Exception:
-                    pass
+                # Normalized + fuzzy dedup: skip near-duplicate memories
+                norm = _norm(content)
+                dup = False
+                for ec in existing_contents:
+                    ec_norm = _norm(ec)
+                    if ec_norm == norm or difflib.SequenceMatcher(None, ec_norm, norm).ratio() >= 0.85:
+                        dup = True
+                        break
+                if dup:
+                    logger.info(f"Duplicate memory skipped: {len(content)} chars")
+                    continue
+                existing_contents.append(content)
 
                 importance = float(mem.get("importance", default_imp))
                 confidence = float(mem.get("confidence", 0.8))
@@ -1106,6 +1125,16 @@ class Deriver:
                 "SELECT id FROM workspaces WHERE name='ev-agent' ORDER BY created_at ASC LIMIT 1"
             ).fetchone()
             wid = ws["id"] if ws else None
+
+            if wid:
+                # Sweep near-duplicates first so the injected set stays clean.
+                try:
+                    import crud as _crud
+                    _crud.dedup_classified("behaviour", wid)
+                    _crud.dedup_classified("preferences", wid)
+                    _crud.dedup_classified("rules", wid)
+                except Exception:
+                    pass
 
             beh, pref, rules, hot = [], [], [], []
             user = {}
