@@ -55,12 +55,12 @@ Required JSON schema:
   "user_mood": "detected mood (happy/frustrated/neutral/urgent/etc) or null",
   "user_preferences": ["concrete stated preference 1", "preference 2"],
   "hot_memories": [
-    {{"content": "a CRITICAL fact that must always be remembered", "importance": 0.9}},
-    {{"content": "another critical always-relevant fact", "importance": 0.95}}
+    {{"content": "a CRITICAL fact that must always be remembered", "importance": 0.9, "confidence": 0.9, "durability": 0.9, "type": "architecture_decision"}},
+    {{"content": "another critical always-relevant fact", "importance": 0.95, "confidence": 0.85, "durability": 0.9, "type": "user"}}
   ],
   "cold_memories": [
-    {{"content": "a DETAILED, specific fact: include names, projects, versions, decisions, code paths, and enough context (2-3 sentences) to stand alone", "importance": 0.5}},
-    {{"content": "another detailed fact retrievable on request", "importance": 0.4}}
+    {{"content": "a DETAILED, specific fact: include names, projects, versions, decisions, code paths, and enough context (2-3 sentences) to stand alone", "importance": 0.5, "confidence": 0.8, "durability": 0.5, "type": "project"}},
+    {{"content": "another detailed fact retrievable on request", "importance": 0.4, "confidence": 0.7, "durability": 0.3, "type": "event"}}
   ],
   "conclusions": ["a new insight about the user or project, phrased uniquely"],
   "agent_assessment": {{"agent_name": "mentioned agent or ''", "verdict": "positive|negative|neutral", "detail": "one-line assessment"}}
@@ -70,7 +70,11 @@ Detailed rules:
 1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints. Keep them short, precise, high importance (0.8-1.0). These are always injected into context.
 2. COLD_MEMORIES = everything else worth keeping. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail: the project being built, the task, the topic, the code/architecture/approach, what the user wants and the specifics around it. Include technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. Do not just record "user wants X" — record what X is, why, and the surrounding detail.
 3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
-4. importance scale: 0.0 (trivial) to 1.0 (must-never-forget). Use 0.8-1.0 for hot, 0.3-0.7 for cold.
+4. Per-memory attributes:
+   - importance: 0.0 (trivial) to 1.0 (must-never-forget). Hot 0.8-1.0, cold 0.3-0.7.
+   - confidence: how sure are we this fact is true, 0.0-1.0 (default 0.8).
+   - durability: how long this fact is likely to stay true, 0.0 (transient/debugging detail) to 1.0 (permanent fact). Architecture decisions ~0.9, a failed command ~0.1.
+   - type: one of: user | preference | project | decision | architecture_decision | tooling | environment | event | debugging_event | conversation_insight.
 5. If the message has no memorable facts, output empty arrays: "hot_memories": [], "cold_memories": [], "conclusions": [].
 6. Return ONLY the JSON object. No markdown fences, no commentary."""
 
@@ -401,6 +405,9 @@ class Deriver:
                     pass
 
                 importance = float(mem.get("importance", default_imp))
+                confidence = float(mem.get("confidence", 0.8))
+                durability = float(mem.get("durability", 0.5))
+                mem_semantic_type = str(mem.get("type", "conversation_insight"))
                 try:
                     emb = None
                     if _ec.is_available():
@@ -415,7 +422,9 @@ class Deriver:
                         type=mem_type,
                         content=content,
                         importance=importance,
-                        confidence=0.8,
+                        confidence=confidence,
+                        durability=durability,
+                        memory_type=mem_semantic_type,
                         source="deriver_llm",
                         metadata={"session_id": session_id, "tier": mem_type},
                         embedding=emb,

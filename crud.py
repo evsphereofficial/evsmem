@@ -138,6 +138,7 @@ def _init_schema(conn):
             embedding TEXT,
             importance REAL DEFAULT 0.5,
             confidence REAL DEFAULT 0.8,
+            durability REAL DEFAULT 0.5,
             observed_count INTEGER DEFAULT 1,
             source TEXT DEFAULT 'conversation',
             metadata TEXT DEFAULT '{}',
@@ -234,6 +235,12 @@ def _init_schema(conn):
     # Migration: add is_processed column to messages (safe for existing DBs)
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN is_processed INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migration: add durability column to memories (safe for existing DBs)
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN durability REAL DEFAULT 0.5")
     except sqlite3.OperationalError:
         pass  # Column already exists
 
@@ -709,21 +716,23 @@ def get_context(session_id, q_emb, top_k=5, max_distance=1.5):
 # ── Memories ──
 
 def create_memory(workspace_id, type, content, user_id=None, agent_name=None,
-                  importance=0.5, confidence=0.8, source='conversation', metadata=None,
-                  embedding=None):
-    """Store a memory with type, importance, confidence. Syncs with FTS5 index."""
+                  importance=0.5, confidence=0.8, durability=0.5, memory_type=None,
+                  source='conversation', metadata=None, embedding=None):
+    """Store a memory with type (tier), memory_type (semantic), importance,
+    confidence, and durability."""
     conn = get_db()
     mid = _uuid()
     metadata_json = json.dumps(metadata or {})
     emb_json = json.dumps(embedding) if embedding else None
+    mem_type = memory_type or type
     conn.execute(
         """INSERT INTO memories
            (id, workspace_id, user_id, agent_name, type, memory_type, content,
-            embedding, importance, confidence, observed_count, source,
+            embedding, importance, confidence, durability, observed_count, source,
             metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (mid, workspace_id, user_id or '', agent_name or '', type, type, content,
-         emb_json, importance, confidence, 1, source,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mid, workspace_id, user_id or '', agent_name or '', type, mem_type, content,
+         emb_json, importance, confidence, durability, 1, source,
          metadata_json, _ts(), _ts()),
     )
     conn.commit()
@@ -829,7 +838,20 @@ def search_memories(workspace_id, query_text, query_emb, type="", user_id="",
         # Confidence factor (reliable memories weighted higher)
         conf_score = r["confidence"]
 
-        final = sem_score * 0.5 + kw_score * 0.3 + imp_score * 0.15 + conf_score * 0.05
+        # Durability (long-lived facts weigh more than transient events)
+        dur_score = r["durability"] if r["durability"] is not None else 0.5
+
+        # Recency decay (recently created memories get a small boost)
+        recency = 0.0
+        try:
+            created_dt = datetime.fromisoformat(r["created_at"])
+            age_days = (datetime.now(timezone.utc) - created_dt).total_seconds() / 86400
+            recency = max(0.0, 1.0 - age_days / 60.0)
+        except Exception:
+            pass
+
+        final = (sem_score * 0.4 + kw_score * 0.2 + imp_score * 0.2
+                 + conf_score * 0.05 + dur_score * 0.1 + recency * 0.05)
 
         results.append({
             "id": r["id"],
@@ -838,6 +860,7 @@ def search_memories(workspace_id, query_text, query_emb, type="", user_id="",
             "memory_type": r["memory_type"],
             "importance": r["importance"],
             "confidence": r["confidence"],
+            "durability": round(float(dur_score), 3),
             "observed_count": r["observed_count"],
             "source": r["source"],
             "score": round(float(final), 4),
