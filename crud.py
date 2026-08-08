@@ -198,6 +198,12 @@ def _init_schema(conn):
             location TEXT DEFAULT '',
             username TEXT DEFAULT '',
             email TEXT DEFAULT '',
+            occupation TEXT DEFAULT '',
+            education TEXT DEFAULT '',
+            interests TEXT DEFAULT '',
+            mood TEXT DEFAULT '',
+            github TEXT DEFAULT '',
+            timezone TEXT DEFAULT '',
             metadata TEXT DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -298,6 +304,15 @@ def _init_schema(conn):
         conn.execute("ALTER TABLE memories ADD COLUMN durability REAL DEFAULT 0.5")
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Migration: expand users table columns (safe for existing DBs)
+    for col in ("occupation TEXT DEFAULT ''", "education TEXT DEFAULT ''",
+                "interests TEXT DEFAULT ''", "mood TEXT DEFAULT ''",
+                "github TEXT DEFAULT ''", "timezone TEXT DEFAULT ''"):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     conn.commit()
 
@@ -945,7 +960,9 @@ def get_rules(workspace_id, limit=100):
     return list_classified("rules", workspace_id, limit)
 
 
-def upsert_user(workspace_id, name=None, age=None, location=None, username=None, metadata=None):
+def upsert_user(workspace_id, name=None, age=None, location=None, username=None,
+                email=None, occupation=None, education=None, interests=None,
+                mood=None, github=None, timezone=None, metadata=None):
     """Create or update the single user row for a workspace. Existing non-empty
     fields are preserved when the new value is empty."""
     conn = get_db()
@@ -953,16 +970,27 @@ def upsert_user(workspace_id, name=None, age=None, location=None, username=None,
     uid = existing["id"] if existing else _uuid()
     meta_json = json.dumps(metadata or {})
     conn.execute(
-        """INSERT INTO users (id, workspace_id, name, age, location, username, metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """INSERT INTO users (id, workspace_id, name, age, location, username, email,
+                              occupation, education, interests, mood, github, timezone,
+                              metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(workspace_id) DO UPDATE SET
              name = CASE WHEN excluded.name != '' THEN excluded.name ELSE users.name END,
              age = CASE WHEN excluded.age != '' THEN excluded.age ELSE users.age END,
              location = CASE WHEN excluded.location != '' THEN excluded.location ELSE users.location END,
              username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+             email = CASE WHEN excluded.email != '' THEN excluded.email ELSE users.email END,
+             occupation = CASE WHEN excluded.occupation != '' THEN excluded.occupation ELSE users.occupation END,
+             education = CASE WHEN excluded.education != '' THEN excluded.education ELSE users.education END,
+             interests = CASE WHEN excluded.interests != '' THEN excluded.interests ELSE users.interests END,
+             mood = CASE WHEN excluded.mood != '' THEN excluded.mood ELSE users.mood END,
+             github = CASE WHEN excluded.github != '' THEN excluded.github ELSE users.github END,
+             timezone = CASE WHEN excluded.timezone != '' THEN excluded.timezone ELSE users.timezone END,
              metadata = excluded.metadata,
              updated_at = excluded.updated_at""",
         (uid, workspace_id, name or '', age or '', location or '', username or '',
+         email or '', occupation or '', education or '', interests or '',
+         mood or '', github or '', timezone or '',
          meta_json, _ts(), _ts()),
     )
     conn.commit()

@@ -51,7 +51,7 @@ Message: "{content}"
 
 Required JSON schema:
 {{
-  "user": {{"name": "extracted user name or null", "age": "extracted age or null", "location": "extracted location or null"}},
+  "user": {{"name": "extracted name or null", "age": "extracted age or null", "location": "extracted location or null", "username": "extracted username or null", "email": "extracted email or null", "occupation": "extracted occupation or null", "education": "extracted education or null", "interests": "extracted interests or null", "mood": "extracted mood or null", "github": "extracted github handle or null"}},
   "user_name": "extracted name or null",
   "user_mood": "detected mood (happy/frustrated/neutral/urgent/etc) or null",
   "user_preferences": ["concrete stated preference 1", "preference 2"],
@@ -84,13 +84,30 @@ Detailed rules:
 4. HOT_MEMORIES = every user info fact NOT already covered by behaviours/preferences/rules: identity, mood, work style, constraints, relationships, decisions. Always injected. Max 8 per message.
 5. COLD_MEMORIES = everything else — the EXTRAS, injected on demand: project/technical details, what the user is building, the task, the topic, code/architecture/approach, technical decisions, tooling, versions, bugs, design rationale. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail. Be DETAILED — project names, exact terms, versions, file paths, 2-3 sentences of context. importance 0.3-0.7.
 6. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
-7. Per-memory attributes:
+7. CRITICAL: NEVER store ev-agent's OWN internal workflow/architecture instructions as rules, preferences, or behaviours — e.g. anything mentioning MANDATORY RULE / MANDATORY WORKFLOW, plan-architect, router, routing token, dispatch, subagent, task(), verify(), evaluate(), system prompt, Domain Boundary, or the orchestrator workflow. Only store instructions/preferences the HUMAN USER gave about how THEY want to work.
+8. Per-memory attributes:
    - importance: 0.0 (trivial) to 1.0 (must-never-forget).
    - confidence: how sure we are this fact is true, 0.0-1.0 (default 0.8).
    - durability: how long this fact is likely to stay true, 0.0 (transient) to 1.0 (permanent).
    - type: user | preference | project | decision | architecture_decision | tooling | environment | event | debugging_event | conversation_insight.
-8. If the message has no memorable facts, output empty arrays for all fields.
-9. Return ONLY the JSON object. No markdown fences, no commentary."""
+9. If the message has no memorable facts, output empty arrays for all fields.
+10. Return ONLY the JSON object. No markdown fences, no commentary."""
+
+
+def _is_workflow_noise(text):
+    """True if the content looks like ev-agent's internal workflow/architecture
+    instructions (system-prompt or subagent boilerplate) that must NEVER be
+    stored as user rules/preferences/behaviours."""
+    low = (text or "").lower()
+    patterns = (
+        "mandatory rule", "mandatory workflow", "plan-architect", "plan_architect",
+        "routing token", "selection token", "plan token", "phase system",
+        "domain boundary", "you are a specialist agent", "dispatch progress",
+        "dispatched x of", "evaluator required", "call the router", "call evaluate",
+        "call generate_agent", "do not skip this step", "bash tool is not available",
+        "skipping the chain", "workflow is enforced", "token enforcement",
+    )
+    return any(p in low for p in patterns)
 
 
 def get_db() -> sqlite3.Connection:
@@ -328,18 +345,23 @@ class Deriver:
         self._store_agent_assessment(parsed, workspace_id)
 
     def _store_user_info(self, parsed: dict, workspace_id: str):
-        """Upsert structured user info (name/age/location) into the users table."""
+        """Upsert structured user info into the users table."""
         user = parsed.get("user")
         if not user or not isinstance(user, dict):
             return
-        name = str(user.get("name") or "").strip()
-        age = str(user.get("age") or "").strip()
-        location = str(user.get("location") or "").strip()
-        if not name and not age and not location:
+        def _g(k):
+            return str(user.get(k) or "").strip() or None
+        vals = {
+            "name": _g("name"), "age": _g("age"), "location": _g("location"),
+            "username": _g("username"), "email": _g("email"),
+            "occupation": _g("occupation"), "education": _g("education"),
+            "interests": _g("interests"), "mood": _g("mood"), "github": _g("github"),
+        }
+        if not any(vals.values()):
             return
         import crud as _crud
         try:
-            _crud.upsert_user(workspace_id, name=name or None, age=age or None, location=location or None)
+            _crud.upsert_user(workspace_id, **vals)
         except Exception as e:
             logger.debug(f"Failed to store user info: {e}")
 
@@ -365,6 +387,9 @@ class Deriver:
                     continue
                 content = content.strip()
                 if len(content) < 5:
+                    continue
+                if _is_workflow_noise(content):
+                    logger.info(f"Skipping workflow noise ({mem_type}): {content[:60]}")
                     continue
                 importance = float(mem.get("importance", default_imp))
                 try:
@@ -492,6 +517,9 @@ class Deriver:
                 if low.startswith("something to remember") or low.startswith("user switched to a rust cli tool") or low.startswith("a concrete fact or preference") or low in (
                     "remember something", "a memory", "a memory to remember",
                 ):
+                    continue
+                if _is_workflow_noise(content):
+                    logger.info(f"Skipping workflow noise ({mem_type}): {content[:60]}")
                     continue
 
                 # Normalized + fuzzy dedup: skip near-duplicate memories
@@ -1135,6 +1163,27 @@ class Deriver:
                     _crud.dedup_classified("rules", wid)
                 except Exception:
                     pass
+                # Purge ev-agent workflow/architecture instructions from the
+                # classified tables (demoted to memories, never deleted).
+                for t in ("behaviour", "preferences", "rules"):
+                    rows = conn.execute(
+                        f"SELECT id, content, importance, confidence, durability, metadata FROM {t} WHERE workspace_id=?",
+                        (wid,),
+                    ).fetchall()
+                    for r in rows:
+                        if _is_workflow_noise(r["content"]):
+                            now = datetime.now(timezone.utc).isoformat()
+                            conn.execute(
+                                """INSERT INTO memories
+                                   (id, workspace_id, user_id, agent_name, type, memory_type, content,
+                                    embedding, importance, confidence, durability, observed_count, source,
+                                    metadata, created_at, updated_at)
+                                   VALUES (?, ?, '', '', 'cold_memory', 'workflow_noise', ?, NULL, ?, ?, ?, 1, 'demoted_workflow_noise', ?, ?, ?)""",
+                                (str(uuid4()), wid, r["content"], r["importance"], r["confidence"], r["durability"],
+                                 r["metadata"] or '{}', now, now),
+                            )
+                            conn.execute(f"DELETE FROM {t} WHERE id=?", (r["id"],))
+                    conn.commit()
 
             beh, pref, rules, hot = [], [], [], []
             user = {}
@@ -1157,12 +1206,20 @@ class Deriver:
                          created_at DESC
                        LIMIT 100""",
                     (wid,)).fetchall()]
-                u = conn.execute("SELECT name, age, location FROM users WHERE workspace_id=?", (wid,)).fetchone()
+                u = conn.execute(
+                    "SELECT name, age, location, username, occupation, education, interests, mood, github "
+                    "FROM users WHERE workspace_id=?", (wid,)).fetchone()
                 if u:
                     user = {
                         "name": u["name"] or "",
                         "age": u["age"] or "",
                         "location": u["location"] or "",
+                        "username": u["username"] or "",
+                        "occupation": u["occupation"] or "",
+                        "education": u["education"] or "",
+                        "interests": u["interests"] or "",
+                        "mood": u["mood"] or "",
+                        "github": u["github"] or "",
                     }
             conn.close()
 
