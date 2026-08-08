@@ -67,8 +67,8 @@ Required JSON schema:
 }}
 
 Detailed rules:
-1. HOT_MEMORIES = facts that shape every future interaction: identity (name, age, location), the user's main projects and their stack, strong preferences, work style, constraints, key relationships, recurring behaviors. Keep them short, precise, high importance (0.8-1.0). LIMIT HOT_MEMORIES TO AT MOST 5 per message — only genuinely critical, identity/project/behavior-level facts. These are always injected into context.
-2. COLD_MEMORIES = everything else worth keeping. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail: the project being built, the task, the topic, the code/architecture/approach, what the user wants and the specifics around it. Include technical decisions, tooling details, version choices, bug details, design rationales, people/projects mentioned. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. Do not just record "user wants X" — record what X is, why, and the surrounding detail.
+1. HOT_MEMORIES = EVERY user info and behavior fact: identity (name, age, location), preferences, habits, moods, work style, constraints, key relationships, recurring behaviors, decisions the user makes about themselves. These are ALWAYS injected into every session. Include EVERY user info/behavior fact from this message; keep each short, precise, importance 0.8-1.0. Max 8 per message.
+2. COLD_MEMORIES = everything else — the EXTRAS, injected on demand: project/technical details, what the user is building, the task, the topic, the code/architecture/approach, technical decisions, tooling, versions, bugs, design rationale, people/projects mentioned. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail. Be DETAILED — project names, exact terms, versions, file paths, and 2-3 sentences of context so the fact stands alone. importance 0.3-0.7.
 3. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
 4. Per-memory attributes:
    - importance: 0.0 (trivial) to 1.0 (must-never-forget). Hot 0.8-1.0, cold 0.3-0.7.
@@ -987,7 +987,7 @@ class Deriver:
         """Cap the hot-memory pool so the always-injected system prompt stays small.
         If more than EVSMEM_HOT_CAP hot memories exist, demote the lowest-scored
         ones (importance x durability) to cold_memory."""
-        cap = int(os.getenv("EVSMEM_HOT_CAP", "50"))
+        cap = int(os.getenv("EVSMEM_HOT_CAP", "100"))
         conn = get_db()
         try:
             rows = conn.execute(
@@ -1019,7 +1019,7 @@ class Deriver:
             conn = get_db()
             rows = conn.execute(
                 "SELECT content, importance FROM memories WHERE type='hot_memory' "
-                "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 15"
+                "ORDER BY (importance * COALESCE(durability, 0.5)) DESC, created_at DESC LIMIT 40"
             ).fetchall()
             conn.close()
             items = [{"content": r["content"], "importance": r["importance"]} for r in rows]
