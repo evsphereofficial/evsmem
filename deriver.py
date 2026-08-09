@@ -78,13 +78,13 @@ Required JSON schema:
 }}
 
 Detailed rules:
-1. BEHAVIOURS = recurring patterns in how the user works/behaves (e.g. "user makes small commits", "user works late", "user prefers to do X before Y"). These are the MOST IMPORTANT — ev-agent must adapt to them. importance 0.8-1.0.
-2. PREFERENCES = stated likes/dislikes/choices (e.g. "user prefers Python over TypeScript", "user prefers dark mode"). importance 0.8-1.0.
-3. RULES = explicit instructions or hard rules the user gave that MUST always be followed (e.g. "never use force delete", "make small git commits to inflate commits", "don't use emojis"). These are CRITICAL — importance 0.95-1.0. Max 5 per message.
+1. BEHAVIOURS = ONLY the user's recurring EMOTIONAL / BEHAVIORAL patterns: how they react and behave (frustration, anger, impatience, excitement, temper, moods, how they communicate under stress). Example: "user gets frustrated easily and uses profane language when code fails". NEVER put work-style preferences, project facts, or tool choices here — those belong in PREFERENCES. Max 4 per message.
+2. PREFERENCES = ONLY stated likes/dislikes/choices for things: technology (Python vs TypeScript), UI (dark mode, no emojis), interaction style (direct/no-fluff responses), how they like to work (small commits, basedev branch). Example: "user prefers Python over TypeScript". NEVER store ev-agent architecture/config/test instructions here. Max 8 per message.
+3. RULES = ONLY hard, explicit instructions the user gives about how the agent should behave toward them — usually phrased with always/never/do not/must. Examples: "never use force delete", "make small git commits to inflate commits", "do not create files without permission", "no emojis". NEVER store ev-agent's own workflow/architecture/config/test/token/UI instructions here. Max 5 per message.
 4. HOT_MEMORIES = every user info fact NOT already covered by behaviours/preferences/rules: identity, mood, work style, constraints, relationships, decisions. Always injected. Max 8 per message.
 5. COLD_MEMORIES = everything else — the EXTRAS, injected on demand: project/technical details, what the user is building, the task, the topic, code/architecture/approach, technical decisions, tooling, versions, bugs, design rationale. MOST IMPORTANTLY capture WHAT THE USER IS TALKING ABOUT in detail. Be DETAILED — project names, exact terms, versions, file paths, 2-3 sentences of context. importance 0.3-0.7.
 6. Every content value MUST be derived strictly from the message. Never invent facts, never output generic placeholders, never copy these instructions.
-7. CRITICAL: NEVER store ev-agent's OWN internal workflow/architecture instructions as rules, preferences, or behaviours — e.g. anything mentioning MANDATORY RULE / MANDATORY WORKFLOW, plan-architect, router, routing token, dispatch, subagent, task(), verify(), evaluate(), system prompt, Domain Boundary, or the orchestrator workflow. Only store instructions/preferences the HUMAN USER gave about how THEY want to work.
+7. CRITICAL: NEVER store ev-agent's OWN internal workflow/architecture/config/test instructions as rules, preferences, or behaviours — e.g. anything mentioning MANDATORY RULE / MANDATORY WORKFLOW, plan-architect, router, routing token, dispatch, subagent, task(), verify(), evaluate(), system prompt, Domain Boundary, the orchestrator workflow, rule numbering ("rule 8"), test loops, integration-test designs, token-expiry design, difficulty-gated planning, or UI/config rendering requests ("render as a compact single line"). Only store instructions/preferences the HUMAN USER gave about how THEY want to work with the agent.
 8. Per-memory attributes:
    - importance: 0.0 (trivial) to 1.0 (must-never-forget).
    - confidence: how sure we are this fact is true, 0.0-1.0 (default 0.8).
@@ -106,6 +106,12 @@ def _is_workflow_noise(text):
         "dispatched x of", "evaluator required", "call the router", "call evaluate",
         "call generate_agent", "do not skip this step", "bash tool is not available",
         "skipping the chain", "workflow is enforced", "token enforcement",
+        "rule 8", "rule 9", "rule 10", "rule numbering", "difficulty-gated planning",
+        "loop test", "integration test design", "test design in the final message",
+        "compact single line", "collapsed ui", "token-expiry", "token expiration",
+        "linked to the completion of to-do", "to-do items", "system prompt must be strict",
+        "the agent must use search memory", "use memory tools as much as possible",
+        "render as", "instead of the generic tool", "bypass complex orchestration",
     )
     return any(p in low for p in patterns)
 
