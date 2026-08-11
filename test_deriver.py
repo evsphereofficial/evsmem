@@ -1,85 +1,177 @@
+"""Tests for the curation Deriver: hour-batch window, rolling analysis cursor,
+and idempotent success/failure marking (messages stay unprocessed after an LLM
+failure so the batch is retried on the next run).
+
+Run from the evsmem directory:
+    .venv\\Scripts\\python.exe -m unittest test_deriver -v
+"""
+
+import gc
+import json
 import sqlite3
+import sys
 import tempfile
+import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest import mock
 
 import deriver
 
 
-class DeriverCursorTest(unittest.TestCase):
+class FakeLLM:
+    """Plain generate-only LLM (local GGUF fallback contract)."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def is_available(self):
+        return True
+
+    def generate(self, messages, max_tokens=512, temperature=0.1):
+        return self._payload
+
+
+class DeriverBatchWindowTest(unittest.TestCase):
     def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.tempdir.name) / "evsmem.db"
-        conn = sqlite3.connect(self.db_path)
-        conn.executescript(
-            """
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL);
-            CREATE TABLE messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                role TEXT NOT NULL
-            );
-            INSERT INTO sessions VALUES ('session-1', 'workspace-1');
-            INSERT INTO messages VALUES ('message-1', 'session-1', 'remember this', 'user');
-            """
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "evsmem.db"
+        self._patchers = [
+            mock.patch.object(deriver, "DB_PATH", self.db_path),
+            mock.patch.object(deriver, "EV_SESSION_DB", Path(self._tmp.name) / "no-session.db"),
+        ]
+        for p in self._patchers:
+            p.start()
+
+        import crud
+        self._crud = crud
+        crud.DB_PATH = self.db_path
+        crud._SCHEMA_READY = False
+        crud._local = threading.local()
+        crud.get_db()  # init full schema on the temp DB
+
+        self.now = datetime.now(timezone.utc)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            "INSERT INTO workspaces (id, name, metadata, created_at) VALUES ('ws1','ev-agent','{}', ?)",
+            (self.now.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, name, metadata, created_at) VALUES ('s1','ws1','auto-save','{}', ?)",
+            (self.now.isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO peers (id, workspace_id, name, metadata, created_at) VALUES ('p1','ws1','user','{}', ?)",
+            (self.now.isoformat(),),
+        )
+        conn.commit()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        try:
+            self._crud.close_db()
+        finally:
+            self._crud.DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
+            gc.collect()
+            try:
+                self._tmp.cleanup()
+            except Exception:
+                pass
+
+    def _add_message(self, mid, minutes_ago, content, processed=0, peer="p1"):
+        ts = (self.now - timedelta(minutes=minutes_ago)).isoformat()
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            """INSERT INTO messages
+               (id, session_id, peer_id, content, role, message_type, metadata,
+                embedding, created_at, is_processed)
+               VALUES (?, ?, ?, ?, 'user', 'message', '{}', NULL, ?, ?)""",
+            (mid, "s1", peer, content, ts, processed),
         )
         conn.commit()
         conn.close()
-        self.db_patch = patch.object(deriver, "DB_PATH", self.db_path)
-        self.db_patch.start()
 
-    def tearDown(self):
-        self.db_patch.stop()
-        self.tempdir.cleanup()
+    def test_hour_batch_collects_all_unprocessed_in_window_ascending(self):
+        # 25 messages all inside the hour window (no LIMIT hard-coded anywhere).
+        for i in range(25):
+            self._add_message(f"m{i}", minutes_ago=5 + i, content=f"message {i}")
+        # Outside the window / already processed / empty content.
+        self._add_message("old", minutes_ago=90, content="too old")
+        self._add_message("done", minutes_ago=10, content="already done", processed=1)
+        self._add_message("empty", minutes_ago=10, content="")
 
-    def test_failed_extraction_does_not_advance_cursor(self):
-        worker = deriver.Deriver()
-        worker._last_message_id = 0
+        d = deriver.Deriver()
+        batch = d._get_hour_batch()
+        self.assertEqual(len(batch), 25)
+        ids = [m["id"] for m in batch]
+        self.assertEqual(ids, sorted(ids, key=lambda s: int(s[1:])))  # ordered by rowid ASC
+        self.assertNotIn("old", ids)
+        self.assertNotIn("done", ids)
+        self.assertNotIn("empty", ids)
 
-        with (
-            patch.object(worker, "_sync_ev_sessions", return_value=0),
-            patch.object(worker, "_analyze_session_reputation"),
-            patch.object(worker, "_check_auto_generate_trigger"),
-            patch.object(worker, "_extract_facts", return_value=None),
-        ):
-            worker.run_once()
-
-        self.assertEqual(worker._last_message_id, 0)
-        self.assertEqual(worker._get_unprocessed_messages()[0]["id"], "message-1")
-
-    def test_successful_extraction_updates_profile_then_advances_cursor(self):
-        worker = deriver.Deriver()
-        worker._last_message_id = 0
-        facts = [
-            {
-                "category": "USER_INFO",
-                "description": "User prefers concise answers",
-                "session_id": "session-1",
-                "workspace_id": "workspace-1",
-            }
-        ]
-
-        with (
-            patch.object(worker, "_sync_ev_sessions", return_value=0),
-            patch.object(worker, "_analyze_session_reputation"),
-            patch.object(worker, "_check_auto_generate_trigger"),
-            patch.object(worker, "_extract_facts", return_value=facts),
-            patch.object(worker, "_store_conclusions") as store,
-            patch.object(worker, "_update_peer_representation") as update,
-        ):
-            worker.run_once()
-
-        store.assert_called_once_with(facts)
-        update.assert_called_once_with(facts)
-        self.assertEqual(worker._last_message_id, 1)
-        conn = sqlite3.connect(self.db_path)
-        value = conn.execute(
-            "SELECT value FROM deriver_state WHERE key='last_message_rowid'"
-        ).fetchone()[0]
+    def test_hour_batch_rolling_cursor_excludes_messages_before_last_pass(self):
+        self._add_message("before_cursor", minutes_ago=40, content="covered by last pass")
+        self._add_message("after_cursor", minutes_ago=20, content="new since last pass")
+        conn = deriver.get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO deriver_state (key, value, updated_at) VALUES ('last_analysis_at', ?, ?)",
+            ((self.now - timedelta(minutes=30)).isoformat(), self.now.isoformat()),
+        )
+        conn.commit()
         conn.close()
-        self.assertEqual(value, "1")
+
+        d = deriver.Deriver()
+        ids = [m["id"] for m in d._get_hour_batch()]
+        self.assertNotIn("before_cursor", ids)
+        self.assertIn("after_cursor", ids)
+
+    def test_successful_pass_marks_processed_and_advances_cursor(self):
+        self._add_message("m1", minutes_ago=10, content="I prefer dark mode and short answers.")
+        payload = json.dumps({
+            "user": {"name": "Rehan"}, "hot_memories": [], "cold_memories": [],
+            "behaviours": [], "preferences": [], "rules": [], "conclusions": [],
+            "agent_assessment": {},
+        })
+        d = deriver.Deriver()
+        d._get_llm = lambda: ("local", FakeLLM(payload))
+        stats = {"messages_processed": 0, "engine": "none", "tool_rounds": 0,
+                 "json_rows": {}, "tool_inserted": {}, "tool_updated": 0,
+                 "tool_moved": 0, "tool_deleted": 0}
+        ok = d._process_new_messages_with_llm(stats)
+        self.assertTrue(ok)
+        self.assertEqual(stats["messages_processed"], 1)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT is_processed FROM messages WHERE id='m1'").fetchone()
+        self.assertEqual(row["is_processed"], 1)
+        cursor = conn.execute(
+            "SELECT value FROM deriver_state WHERE key='last_analysis_at'"
+        ).fetchone()
+        self.assertIsNotNone(cursor)
+        conn.close()
+
+    def test_failed_pass_leaves_messages_unprocessed_and_cursor_untouched(self):
+        self._add_message("m1", minutes_ago=10, content="message that will fail analysis")
+        d = deriver.Deriver()
+        d._get_llm = lambda: ("local", FakeLLM("```json\n{this is not json\n```"))
+        stats = {"messages_processed": 0, "engine": "none", "tool_rounds": 0,
+                 "json_rows": {}, "tool_inserted": {}, "tool_updated": 0,
+                 "tool_moved": 0, "tool_deleted": 0}
+        with self.assertRaises(RuntimeError):
+            d._process_new_messages_with_llm(stats)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT is_processed FROM messages WHERE id='m1'").fetchone()
+        self.assertEqual(row["is_processed"], 0)
+        cursor = conn.execute(
+            "SELECT value FROM deriver_state WHERE key='last_analysis_at'"
+        ).fetchone()
+        self.assertIsNone(cursor)
+        conn.close()
 
 
 if __name__ == "__main__":

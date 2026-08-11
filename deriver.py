@@ -1,14 +1,18 @@
 """
-evsmem Deriver — background session sync.
+evsmem Deriver — background session sync + batched memory curation.
 
-Reads new messages from ev-agent sessions and syncs them
-into the evsmem database for memory storage.
+Reads new messages from ev-agent sessions and syncs them into the evsmem
+database for memory storage. A scheduler runs one LLM analysis pass at start
+and then once per 60-minute window (EVSMEM_DERIVE_INTERVAL); each pass batches
+ALL unprocessed messages from the past hour into a single LLM request and
+stores the extracted rows across the memory tables. Message sync (upsert by
+source id) keeps running between passes.
 
 Usage:
   from deriver import Deriver
   d = Deriver()
-  d.run_once()          # process all new messages
-  d.run_forever()       # poll every N seconds
+  d.run_once()          # one full pass (sync + analysis + hot JSON)
+  d.run_forever()       # scheduler: immediate pass, then hourly
 """
 
 import hashlib
@@ -18,9 +22,9 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -38,8 +42,27 @@ DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
 # Ev-agent session DB path
 EV_SESSION_DB = Path.home() / ".local" / "share" / "ev-agent" / "ev-agent-local.db"
 
+# Legacy 5s poll interval — kept for backward compatibility, no longer used by
+# the scheduler (see EVSMEM_DERIVE_INTERVAL below).
 POLL_INTERVAL = float(os.getenv("DERIVER_POLL_INTERVAL", "5.0"))
 MAX_FACTS_PER_BATCH = int(os.getenv("DERIVER_MAX_FACTS", "10"))
+
+# Scheduler cadence: one LLM analysis pass immediately at start, then once per
+# EVSMEM_DERIVE_INTERVAL seconds (default 60 minutes). Message sync keeps
+# running every EVSMEM_SYNC_INTERVAL seconds between analysis passes.
+DERIVE_INTERVAL = max(float(os.getenv("EVSMEM_DERIVE_INTERVAL", "3600")), 5.0)
+SYNC_INTERVAL = max(float(os.getenv("EVSMEM_SYNC_INTERVAL", "30")), 5.0)
+
+# Batch window (hours) used on the FIRST run before any analysis cursor exists.
+BATCH_WINDOW_HOURS = float(os.getenv("EVSMEM_BATCH_HOURS", "1"))
+
+# Remote LLM (DeepSeek) is preferred when available; the local GGUF LLMClient
+# is the fallback. DeepSeekClient is owned by llm_client.py (parallel work) —
+# import defensively so this module works with or without it.
+try:
+    from llm_client import DeepSeekClient
+except ImportError:  # pragma: no cover - depends on parallel work in llm_client.py
+    DeepSeekClient = None
 
 
 # ── LLM Analysis Prompt ──
@@ -92,6 +115,154 @@ Detailed rules:
    - type: user | preference | project | decision | architecture_decision | tooling | environment | event | debugging_event | conversation_insight.
 9. If the message has no memorable facts, output empty arrays for all fields.
 10. Return ONLY the JSON object. No markdown fences, no commentary."""
+
+
+# ── Batch-mode prompt (one analysis request per hour-window) ──
+
+LLM_BATCH_PREAMBLE = """\
+You are analyzing a BATCH of {count} messages exchanged during the last hour between a human user and an AI coding assistant. Produce ONE valid JSON object covering the WHOLE batch: array items (hot_memories, cold_memories, behaviours, preferences, rules, conclusions) may draw facts from ANY of the messages. The per-message maximums scale with the batch size (e.g. up to 4 behaviours per message → up to {count}*4 behaviours total). Never invent facts, never output generic placeholders, and NEVER store ev-agent's own internal workflow/architecture/config/test instructions."""
+
+
+# Additional system context appended to every batch analysis. It gives the
+# model the last hour of existing memory state so it can detect duplicates and
+# fix wrong-table placements instead of blindly re-adding rows.
+LLM_CONTEXT_SECTION = """\
+You will also receive the existing memory state below. Use it to detect duplicates and correct wrong-table placements:
+- If an extracted fact already exists (same meaning), do NOT re-add it.
+- If a fact belongs in another table, place it in the correct table, or use the update_memory_row tool to move/update the existing row (row ids are shown below).
+- If an existing row is a duplicate of another or is obsolete, use delete_memory_row (with a reason).
+- NEVER store ev-agent internal workflow details in any table.
+
+EXISTING MEMORY STATE:
+--- Last 60 minutes of existing memories (id | content | importance | type) ---
+{recent_memories}
+--- Latest memory (id | content | importance | type) ---
+{latest_memory}
+--- Latest behaviours (id | content | importance) ---
+{behaviours}
+--- User profile ---
+{user}
+--- Latest preferences (id | content | importance) ---
+{preferences}
+--- Latest rules (id | content | importance) ---
+{rules}"""
+
+
+# ── OpenAI function-calling tools for memory curation ──
+
+MEMORY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add_memory_rows",
+            "description": (
+                "Insert one or more NEW memory rows across the memory tables. "
+                "Use only for facts extracted from the batch that do not already "
+                "exist in the provided memory state."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "table": {
+                                    "type": "string",
+                                    "enum": ["memories", "behaviour", "preferences", "rules", "users", "agent_written_memory"],
+                                },
+                                "content": {"type": "string", "description": "The fact to store (for table=users this is a summary line; structured user fields are set via the name/age/... fields)."},
+                                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "durability": {"type": "number", "minimum": 0, "maximum": 1},
+                                "type": {"type": "string", "description": "For memories: 'hot_memory'/'cold_memory' tier or a semantic type (project, user, decision...). For others: optional."},
+                                "memory_type": {"type": "string"},
+                            },
+                            "required": ["table", "content"],
+                        },
+                    }
+                },
+                "required": ["rows"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory_row",
+            "description": (
+                "Update an existing memory row (content, importance, type, ...) "
+                "or MOVE it to a different table when it was placed wrong. "
+                "Always provide a short reason."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "enum": ["memories", "behaviour", "preferences", "rules", "users", "agent_written_memory"],
+                    },
+                    "row_id": {"type": "string", "description": "The id of the existing row (shown in the memory state context)."},
+                    "fields": {"type": "object", "description": "Columns to change, e.g. {\"content\": \"...\", \"importance\": 0.9}."},
+                    "move_to_table": {
+                        "type": ["string", "null"],
+                        "enum": [None, "memories", "behaviour", "preferences", "rules", "agent_written_memory"],
+                        "description": "If set, move the row to this table instead of updating in place.",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["table", "row_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory_row",
+            "description": (
+                "Permanently delete an existing memory row (duplicate of another "
+                "row, wrong-table placeholder, or obsolete/contradicted fact). "
+                "Always provide a reason."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "enum": ["memories", "behaviour", "preferences", "rules", "users", "agent_written_memory"],
+                    },
+                    "row_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["table", "row_id", "reason"],
+            },
+        },
+    },
+]
+
+
+def _as_dict(v):
+    """Coerce a dict / pydantic model / arbitrary object into a plain dict."""
+    if isinstance(v, dict):
+        return v
+    for attr in ("model_dump", "dict"):
+        fn = getattr(v, attr, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, dict):
+                    return out
+            except Exception:
+                pass
+    if hasattr(v, "__dict__"):
+        return dict(v.__dict__)
+    return {}
+
+
+def _empty_tool_stats() -> dict:
+    return {"inserted": {}, "updated": 0, "moved": 0, "deleted": 0,
+            "applied": False, "rounds": 0}
 
 
 def _is_workflow_noise(text):
@@ -159,30 +330,47 @@ class Deriver:
     def __init__(self):
         self._last_processed_rowid: Optional[int] = None
         self._running = False
+        # Guards analysis passes so two passes never run concurrently (e.g. a
+        # slow LLM batch overlapping the next scheduled window).
+        self._analysis_lock = Lock()
 
-    # ── Cursor-based message tracking ──
+    # ── Batch message tracking ──
 
-    def _get_unprocessed_messages(self) -> list[dict]:
-        """Get unprocessed messages using the per-row is_processed flag.
+    def _get_hour_batch(self) -> list[dict]:
+        """All unprocessed messages accumulated since the previous successful
+        analysis pass — a rolling 1-hour window (no LIMIT), oldest first.
 
-        Only messages created within a short lookback window (default 24h) AND
-        older than 30 seconds are considered — so the deriver handles LIVE
-        messages and never re-processes old backlog/history.
+        On the first run the window defaults to the last `BATCH_WINDOW_HOURS`
+        (default 1). Messages younger than 30 seconds are excluded so streamed
+        messages settle first. The window cursor (`deriver_state.last_analysis_at`)
+        only advances on a successful pass, so after an LLM failure the same
+        batch is left unprocessed and retried on the next run.
         """
-        lookback_hours = int(os.getenv("EVSMEM_PROCESS_LOOKBACK_HOURS", "24"))
+        window_hours = float(os.getenv("EVSMEM_BATCH_HOURS", str(BATCH_WINDOW_HOURS)))
         conn = get_db()
         try:
-            rows = conn.execute(
-                f"""SELECT m.rowid, m.id, m.content, m.role, m.session_id,
-                           s.workspace_id, m.metadata
-                    FROM messages m
-                    JOIN sessions s ON m.session_id = s.id
-                    WHERE m.is_processed = 0 AND m.content != ''
-                      AND m.created_at >= strftime('%Y-%m-%dT%H:%M:%f', 'now', '-{lookback_hours} hours')
-                      AND m.created_at <= strftime('%Y-%m-%dT%H:%M:%f', 'now', '-30 seconds')
-                    ORDER BY m.rowid DESC
-                    LIMIT 20""",
-            ).fetchall()
+            cursor = conn.execute(
+                "SELECT value FROM deriver_state WHERE key='last_analysis_at'"
+            ).fetchone()
+
+            sql = """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
+                            s.workspace_id, m.metadata
+                     FROM messages m
+                     JOIN sessions s ON m.session_id = s.id
+                     WHERE m.is_processed = 0 AND m.content != ''
+                       AND m.created_at <= ?"""
+            params: list = [(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()]
+            if cursor and cursor["value"]:
+                # Rolling window: messages created after the last successful pass.
+                sql += " AND m.created_at > ?"
+                params.append(cursor["value"])
+            else:
+                # First run: the last hour (or EVSMEM_BATCH_HOURS if set).
+                sql += " AND m.created_at >= ?"
+                params.append((datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat())
+            sql += " ORDER BY m.rowid ASC"
+
+            rows = conn.execute(sql, params).fetchall()
 
             out = []
             for r in rows:
@@ -204,6 +392,15 @@ class Deriver:
         finally:
             conn.close()
 
+    def _get_workspace_batches(self) -> dict[str, list[dict]]:
+        """Group the hour batch by workspace (each workspace is analyzed
+        separately). In practice all synced messages share the 'ev-agent'
+        workspace, but this keeps the pipeline correct if that ever changes."""
+        batches: dict[str, list[dict]] = {}
+        for msg in self._get_hour_batch():
+            batches.setdefault(msg["workspace_id"], []).append(msg)
+        return batches
+
     def _mark_message_processed(self, rowid: int):
         """Mark a single message as processed (is_processed = 1)."""
         conn = get_db()
@@ -213,40 +410,456 @@ class Deriver:
         finally:
             conn.close()
 
+    def _mark_messages_processed(self, rowids: list[int]):
+        """Mark a whole batch processed in one UPDATE (post-pass success path)."""
+        if not rowids:
+            return
+        conn = get_db()
+        try:
+            for i in range(0, len(rowids), 500):
+                chunk = rowids[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"UPDATE messages SET is_processed = 1 WHERE rowid IN ({placeholders})",
+                    chunk,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _advance_analysis_cursor(self):
+        """Record the successful analysis time so the next pass only picks up
+        messages written after it (idempotent rolling window)."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = get_db()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
+                   VALUES ('last_analysis_at', ?, ?)""",
+                (now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── LLM Processing Pipeline ──
 
-    def _process_new_messages_with_llm(self) -> int:
-        """Process unprocessed messages through local LLM to extract facts.
-
-        Returns the number of messages successfully processed.
-        """
+    def _get_llm(self):
+        """Return (engine, llm): remote DeepSeek when available (with tool
+        calling), otherwise the local GGUF LLMClient fallback."""
         from llm_client import LLMClient
 
-        llm = LLMClient()
-        if not llm.is_available():
-            logger.debug("LLM not available, skipping message processing")
-            return 0
-
-        messages = self._get_unprocessed_messages()
-        if not messages:
-            return 0
-
-        processed = 0
-        for msg in messages:
-            rowid = msg["rowid"]
+        if DeepSeekClient is not None:
             try:
-                parsed = self._analyze_message_with_llm(llm, msg)
-                if parsed:
-                    self._store_llm_results(parsed, msg)
-                    processed += 1
+                llm = DeepSeekClient()
+                available = getattr(llm, "is_available", None)
+                if available is None or available():
+                    logger.info("Using remote DeepSeek client for memory analysis")
+                    return "remote", llm
             except Exception as e:
-                logger.warning(f"LLM processing error for msg {rowid}: {e}")
-            finally:
-                self._mark_message_processed(rowid)
+                logger.warning(f"DeepSeek client failed to initialize: {e}")
 
-        if processed > 0:
-            logger.info(f"Deriver: processed {processed} messages")
-        return processed
+        llm = LLMClient()
+        if llm.is_available():
+            return "local", llm
+        return None, None
+
+    def _process_new_messages_with_llm(self, stats: dict) -> bool:
+        """Analyze the hour-batch through the LLM and store the extracted rows.
+
+        `stats` is filled in-place (engine, messages_processed, json_rows,
+        tool_inserted/updated/moved/deleted, tool_rounds) so the caller can
+        emit one structured log line per run. Returns True on success.
+
+        Idempotency contract: messages are marked is_processed=1 and the
+        analysis cursor is advanced ONLY after the whole pass succeeds; on LLM
+        failure (exception, empty reply, unparseable JSON) the batch is left
+        unprocessed and retried on the next run.
+        """
+        engine, llm = self._get_llm()
+        stats["engine"] = engine or "none"
+        if llm is None:
+            logger.debug("LLM not available, skipping message processing")
+            return False
+
+        batches = self._get_workspace_batches()
+        total = sum(len(v) for v in batches.values())
+        stats["messages_processed"] = total
+        if total == 0:
+            # Nothing new; roll the window forward so it doesn't grow unbounded.
+            self._advance_analysis_cursor()
+            return True
+
+        try:
+            for workspace_id, msgs in batches.items():
+                parsed, tool_stats = self._analyze_batch_with_llm(llm, msgs, workspace_id, engine)
+                self._accumulate_tool_stats(stats, tool_stats)
+                if parsed:
+                    json_rows = self._count_json_rows(parsed)
+                    for table, n in json_rows.items():
+                        stats["json_rows"][table] = stats["json_rows"].get(table, 0) + n
+                    self._store_batch_llm_results(parsed, msgs)
+                elif not tool_stats["applied"]:
+                    # LLM produced neither parseable JSON nor tool actions.
+                    raise RuntimeError("LLM returned no parseable analysis and no tool calls")
+
+            # Post-pass success path: only now mark the whole batch processed.
+            all_rowids = [m["rowid"] for batch in batches.values() for m in batch]
+            self._mark_messages_processed(all_rowids)
+            self._advance_analysis_cursor()
+            return True
+        except Exception:
+            # Leave messages unprocessed and the cursor unadvanced → retried next run.
+            raise
+
+    def _accumulate_tool_stats(self, stats: dict, tool_stats: dict):
+        for table, n in (tool_stats.get("inserted") or {}).items():
+            stats["tool_inserted"][table] = stats["tool_inserted"].get(table, 0) + n
+        stats["tool_updated"] += tool_stats.get("updated", 0)
+        stats["tool_moved"] += tool_stats.get("moved", 0)
+        stats["tool_deleted"] += tool_stats.get("deleted", 0)
+        stats["tool_rounds"] = max(stats.get("tool_rounds", 0), tool_stats.get("rounds", 0))
+
+    def _format_batch_for_prompt(self, msgs: list[dict]) -> str:
+        """Render the batch as one prompt block (strips [auto:..] prefixes and
+        adds role/subagent notes, mirroring the single-message path)."""
+        parts = []
+        for i, m in enumerate(msgs, 1):
+            content = (m.get("content") or "").strip()
+            if content.startswith("[auto:"):
+                idx = content.find("] ", 6)
+                if idx != -1:
+                    content = content[idx + 2:].strip()
+            role = m.get("role", "user")
+            if m.get("is_subagent"):
+                content = (
+                    "[NOTE: This message is from an INTERNAL SUBAGENT session, NOT a "
+                    "direct statement from the human user. Do NOT infer the user's name, "
+                    "preferences, identity, or mood from it. Only extract concrete "
+                    "technical/project facts if clearly present.]\n" + content
+                )
+            elif role == "assistant":
+                content = (
+                    "[NOTE: This is the AI ASSISTANT's response. It contains the DETAILED "
+                    "technical/project context of what is being built. Do NOT attribute "
+                    "these statements as the human user's own words or preferences.]\n" + content
+                )
+            parts.append(f"--- Message {i} (role={role}) ---\n{content}")
+        return "\n\n".join(parts)
+
+    def _build_memory_context(self, workspace_id: str) -> str:
+        """Snapshot the existing memory state (last hour of memories, latest
+        memory, behaviours, user profile, preferences, rules) so the model can
+        detect duplicates and fix wrong-table placements."""
+        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        conn = get_db()
+        try:
+            recent = conn.execute(
+                """SELECT id, content, importance, type FROM memories
+                   WHERE workspace_id=? AND created_at >= ?
+                   ORDER BY created_at DESC LIMIT 15""",
+                (workspace_id, one_hour_ago),
+            ).fetchall()
+            latest = conn.execute(
+                """SELECT id, content, importance, type FROM memories
+                   WHERE workspace_id=? ORDER BY created_at DESC LIMIT 1""",
+                (workspace_id,),
+            ).fetchone()
+            behaviours = conn.execute(
+                """SELECT id, content, importance FROM behaviour
+                   WHERE workspace_id=? ORDER BY created_at DESC LIMIT 5""",
+                (workspace_id,),
+            ).fetchall()
+            prefs = conn.execute(
+                """SELECT id, content, importance FROM preferences
+                   WHERE workspace_id=? ORDER BY created_at DESC LIMIT 5""",
+                (workspace_id,),
+            ).fetchall()
+            rules = conn.execute(
+                """SELECT id, content, importance FROM rules
+                   WHERE workspace_id=? ORDER BY created_at DESC LIMIT 5""",
+                (workspace_id,),
+            ).fetchall()
+            user = conn.execute(
+                """SELECT name, age, location, username, email, occupation,
+                          education, interests, mood, github
+                   FROM users WHERE workspace_id=?""",
+                (workspace_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        def _fmt(rows, cols):
+            out = []
+            for r in rows:
+                out.append(" | ".join(str(r[c] or "") for c in cols))
+            return "\n".join(out) if out else "(none)"
+
+        return LLM_CONTEXT_SECTION.format(
+            recent_memories=_fmt(recent, ("id", "content", "importance", "type")),
+            latest_memory=(
+                f"{latest['id']} | {latest['content']} | {latest['importance']} | {latest['type']}"
+                if latest else "(none)"
+            ),
+            behaviours=_fmt(behaviours, ("id", "content", "importance")),
+            user=json.dumps(dict(user), default=str) if user else "(unknown)",
+            preferences=_fmt(prefs, ("id", "content", "importance")),
+            rules=_fmt(rules, ("id", "content", "importance")),
+        )
+
+    def _analyze_batch_with_llm(self, llm, msgs: list[dict], workspace_id: str, engine: str):
+        """Build the batch prompt, call the LLM (with tool calling when the
+        client supports it), and return (parsed_json_or_None, tool_stats)."""
+        content = self._format_batch_for_prompt(msgs)
+        if len(content) < 10:
+            return None, _empty_tool_stats()
+
+        context = self._build_memory_context(workspace_id)
+        batch_cap = int(os.getenv("EVSMEM_BATCH_MAX_CHARS", "24000"))
+        truncated = content if len(content) <= batch_cap else content[:batch_cap] + "\n...[truncated]"
+        user_prompt = (
+            LLM_BATCH_PREAMBLE.format(count=len(msgs))
+            + "\n\n"
+            + LLM_ANALYSIS_PROMPT.format(content=truncated)
+        )
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_prompt},
+        ]
+        return self._call_llm_with_tools(llm, messages, workspace_id, engine)
+
+    def _call_llm_with_tools(self, llm, messages: list[dict], workspace_id: str,
+                             engine: str, max_rounds: int = 3):
+        """Run the batch through generate_with_tools when available (applying
+        tool calls atomically and feeding results back for up to `max_rounds`
+        rounds), else fall back to plain generate + JSON parse.
+
+        Returns (parsed_json_or_None, tool_stats).
+        """
+        tool_stats = _empty_tool_stats()
+        gen = getattr(llm, "generate_with_tools", None)
+        max_tokens = 4096 if engine == "remote" else 2048
+
+        if gen is None:
+            # Plain chat completion (local GGUF fallback): ask for the JSON
+            # schema output directly; no tool loop.
+            raw = llm.generate(messages=messages, max_tokens=max_tokens, temperature=0.1)
+            if not raw:
+                return None, tool_stats
+            return self._parse_llm_output(raw), tool_stats
+
+        conversation = list(messages)
+        final_content = ""
+        for rnd in range(max_rounds + 1):
+            try:
+                try:
+                    resp = gen(messages=conversation, tools=MEMORY_TOOLS,
+                               tool_choice="auto", max_tokens=max_tokens, temperature=0.1)
+                except TypeError:
+                    resp = gen(messages=conversation, tools=MEMORY_TOOLS,
+                               max_tokens=max_tokens, temperature=0.1)
+            except Exception as e:
+                logger.warning(f"generate_with_tools round {rnd} failed: {e}")
+                break
+
+            content, tool_calls = self._normalize_llm_response(resp)
+            final_content = content or final_content
+
+            if not tool_calls:
+                break
+
+            tool_stats["rounds"] += 1
+            stats, results = self._apply_tool_calls(tool_calls, workspace_id)
+            tool_stats["applied"] = tool_stats["applied"] or bool(stats["inserted"] or stats["updated"] or stats["moved"] or stats["deleted"])
+            for table, n in stats["inserted"].items():
+                tool_stats["inserted"][table] = tool_stats["inserted"].get(table, 0) + n
+            tool_stats["updated"] += stats["updated"]
+            tool_stats["moved"] += stats["moved"]
+            tool_stats["deleted"] += stats["deleted"]
+
+            # Feed the tool results back so the model can finish/continue.
+            formatted_calls = []
+            for tc in tool_calls:
+                tcd = _as_dict(tc)
+                fn = tcd.get("function") or tcd
+                cid = tcd.get("id") or f"call_{uuid4().hex[:8]}"
+                name = fn.get("name") or tcd.get("name") or ""
+                formatted_calls.append({
+                    "id": cid,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": fn.get("arguments") or tcd.get("arguments") or "{}",
+                    },
+                })
+            conversation.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": formatted_calls,
+            })
+            for tc in formatted_calls:
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "content": json.dumps(results.get(tc["id"], {"ok": False, "error": "unknown tool call"}),
+                                         default=str),
+                })
+
+            if rnd >= max_rounds - 1:
+                break
+
+        if not final_content.strip():
+            return None, tool_stats
+        return self._parse_llm_output(final_content), tool_stats
+
+    def _normalize_llm_response(self, resp):
+        """Extract (content, tool_calls) from common generate_with_tools return
+        shapes: OpenAI chat-completion dict, {content, tool_calls} dict, plain
+        string, or a model object."""
+        if resp is None:
+            return "", []
+        if isinstance(resp, str):
+            return resp, []
+        resp = _as_dict(resp)
+        if "choices" in resp and isinstance(resp["choices"], list) and resp["choices"]:
+            msg = resp["choices"][0].get("message") or {}
+            return msg.get("content") or "", msg.get("tool_calls") or []
+        if resp.get("message") and isinstance(resp["message"], dict):
+            return resp["message"].get("content") or "", resp["message"].get("tool_calls") or []
+        return resp.get("content") or "", resp.get("tool_calls") or []
+
+    def _apply_tool_calls(self, tool_calls, workspace_id: str):
+        """Execute the model's tool_calls against crud atomically (single
+        SQLite transaction: all-or-nothing). Embeddings are computed BEFORE the
+        transaction opens so no slow network/GPU call holds the DB lock.
+
+        Returns (aggregate_stats, per_call_results)."""
+        import crud as _crud
+        from embeddings import EmbeddingClient
+
+        stats = {"inserted": {}, "updated": 0, "moved": 0, "deleted": 0}
+        calls = []
+        for tc in tool_calls:
+            tcd = _as_dict(tc)
+            fn = tcd.get("function") or tcd
+            name = fn.get("name") or tcd.get("name")
+            if not name:
+                continue
+            try:
+                args = fn.get("arguments") or tcd.get("arguments") or "{}"
+                args = json.loads(args) if isinstance(args, str) else (args or {})
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append((name, args, tcd.get("id") or f"call_{uuid4().hex[:8]}"))
+
+        if not calls:
+            return stats, {}
+
+        # Embed all new/updated contents before opening the transaction.
+        _ec = EmbeddingClient()
+        def _embed(text):
+            try:
+                if _ec.is_available():
+                    return _ec.embed((text or "")[:2000])
+            except Exception:
+                pass
+            return None
+        for name, args, _ in calls:
+            if name == "add_memory_rows":
+                for row in args.get("rows") or []:
+                    if isinstance(row, dict) and row.get("content") and "embedding" not in row:
+                        row["embedding"] = _embed(row["content"])
+            elif name == "update_memory_row":
+                fields = args.get("fields")
+                if isinstance(fields, dict) and fields.get("content") and "embedding" not in fields:
+                    fields["embedding"] = _embed(fields["content"])
+
+        results = {}
+        conn = _crud.get_db()
+        try:
+            conn.execute("BEGIN")
+            for name, args, call_id in calls:
+                if name == "add_memory_rows":
+                    inserted_here = 0
+                    for row in args.get("rows") or []:
+                        if not isinstance(row, dict) or not row.get("table"):
+                            continue
+                        _crud.add_memory_row(row["table"], workspace_id, row, conn=conn)
+                        inserted_here += 1
+                        stats["inserted"][row["table"]] = stats["inserted"].get(row["table"], 0) + 1
+                    results[call_id] = {"ok": True, "inserted": inserted_here}
+                elif name == "update_memory_row":
+                    res = _crud.update_memory_row(
+                        args.get("table"), args.get("row_id"),
+                        args.get("fields") or {}, args.get("move_to_table"),
+                        args.get("reason") or "", conn=conn,
+                    )
+                    if res.get("ok"):
+                        if res.get("action") == "moved":
+                            stats["moved"] += 1
+                        elif res.get("action") == "updated":
+                            stats["updated"] += 1
+                    results[call_id] = res
+                elif name == "delete_memory_row":
+                    res = _crud.delete_memory_row(
+                        args.get("table"), args.get("row_id"),
+                        args.get("reason") or "", conn=conn,
+                    )
+                    if res.get("ok"):
+                        stats["deleted"] += 1
+                    results[call_id] = res
+                else:
+                    results[call_id] = {"ok": False, "error": f"unknown tool '{name}'"}
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning(f"Tool-call transaction failed, rolled back: {e}")
+            raise
+
+        return stats, results
+
+    def _store_batch_llm_results(self, parsed: dict, msgs: list[dict]):
+        """Dispatch a batch-level analysis result to the storage targets using
+        the first session id for metadata (the store functions already dedup)."""
+        if not msgs:
+            return
+        first = msgs[0]
+        session_ids = []
+        for m in msgs:
+            sid = m.get("session_id")
+            if sid and sid not in session_ids:
+                session_ids.append(sid)
+        msg = {
+            "session_id": session_ids[0] if session_ids else first.get("session_id"),
+            "workspace_id": first.get("workspace_id"),
+            "_batch_size": len(msgs),
+            "_batch_session_ids": session_ids,
+        }
+        self._store_llm_results(parsed, msg)
+
+    def _count_json_rows(self, parsed: dict) -> dict:
+        """Count rows the JSON analysis asked us to insert, per table."""
+        counts = {}
+        mapping = (
+            ("hot_memories", "memories"), ("cold_memories", "memories"),
+            ("memories", "memories"), ("behaviours", "behaviour"),
+            ("preferences", "preferences"), ("rules", "rules"),
+            ("conclusions", "conclusions"),
+        )
+        for key, table in mapping:
+            items = parsed.get(key)
+            if isinstance(items, list):
+                counts[table] = counts.get(table, 0) + len(items)
+        user = parsed.get("user")
+        if isinstance(user, dict) and any(user.values()):
+            counts["users"] = counts.get("users", 0) + 1
+        return counts
 
     def _analyze_message_with_llm(self, llm, msg: dict) -> Optional[dict]:
         """Build prompt, call LLM, and parse the JSON response.
@@ -1248,15 +1861,36 @@ class Deriver:
             logger.warning(f"[hot] Failed to write hot_memories.json: {e}")
 
     def run_once(self) -> int:
-        """Sync ev-agent sessions to evsmem, process with LLM, then analyze."""
+        """Sync ev-agent sessions to evsmem, run one batched LLM analysis pass,
+        then analyze reputation / auto-gen triggers / hot-memory JSON.
+
+        Emits one structured per-run log line (JSON) with the number of messages
+        processed, the engine used (remote/local), rows inserted per table, and
+        update/move/delete counts.
+        """
         synced = self._sync_ev_sessions()
+        stats = {
+            "messages_processed": 0,
+            "engine": "none",
+            "tool_rounds": 0,
+            "json_rows": {},
+            "tool_inserted": {},
+            "tool_updated": 0,
+            "tool_moved": 0,
+            "tool_deleted": 0,
+            "hot_json_written": False,
+            "error": None,
+        }
+        t0 = time.monotonic()
         try:
-            self._process_new_messages_with_llm()
+            self._process_new_messages_with_llm(stats)
         except Exception as e:
+            stats["error"] = f"llm_pass: {e}"
             logger.warning(f"LLM processing error: {e}")
         try:
             self._analyze_session_reputation()
         except Exception as e:
+            stats["error"] = f"reputation: {e}"
             logger.warning(f"Reputation analysis error: {e}")
         try:
             self._check_auto_generate_trigger()
@@ -1264,24 +1898,45 @@ class Deriver:
             logger.warning(f"Auto-generate trigger error: {e}")
         try:
             self._prune_hot_memories()
-        except Exception as e:
-            logger.warning(f"Hot-memory prune error: {e}")
-        try:
             self._write_hot_memories_json()
+            stats["hot_json_written"] = True
         except Exception as e:
             logger.warning(f"Hot-memory JSON write error: {e}")
+
+        stats["duration_s"] = round(time.monotonic() - t0, 3)
+        logger.info("deriver_analysis_pass " + json.dumps(stats, default=str))
         return synced
 
     def run_forever(self):
-        """Poll for new messages indefinitely."""
+        """Idempotent scheduler: one analysis pass immediately at start, then
+        once per EVSMEM_DERIVE_INTERVAL (default 60 minutes). A threading.Lock
+        prevents overlapping passes. Message sync (upsert by source id) keeps
+        running every EVSMEM_SYNC_INTERVAL between analysis passes so new
+        messages flow into evsmem without triggering the LLM."""
         self._running = True
-        logger.info(f"Deriver started (poll every {POLL_INTERVAL}s)")
+        logger.info(
+            f"Deriver started (analysis pass now, then every {DERIVE_INTERVAL:.0f}s; "
+            f"message sync every {SYNC_INTERVAL:.0f}s)"
+        )
+        next_analysis = 0.0
         while self._running:
-            try:
-                self.run_once()
-            except Exception as e:
-                logger.error(f"Deriver error: {e}", exc_info=True)
-            time.sleep(POLL_INTERVAL)
+            if time.monotonic() >= next_analysis:
+                if self._analysis_lock.acquire(blocking=False):
+                    try:
+                        self.run_once()
+                    except Exception as e:
+                        logger.error(f"Deriver pass error: {e}", exc_info=True)
+                    finally:
+                        self._analysis_lock.release()
+                else:
+                    logger.warning("Deriver: analysis pass skipped — previous pass still running")
+                next_analysis = time.monotonic() + DERIVE_INTERVAL
+            else:
+                try:
+                    self._sync_ev_sessions()
+                except Exception as e:
+                    logger.warning(f"Deriver sync error: {e}")
+            time.sleep(max(1.0, min(SYNC_INTERVAL, DERIVE_INTERVAL)))
 
     def stop(self):
         self._running = False

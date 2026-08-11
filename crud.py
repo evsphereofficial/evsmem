@@ -311,6 +311,17 @@ def _init_schema(conn):
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS curation_audit (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            row_id TEXT,
+            content TEXT DEFAULT '',
+            reason TEXT DEFAULT '',
+            detail TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_curation_audit_created ON curation_audit(created_at);
     """)
     # Migration: add domain columns to agents (safe for existing DBs)
     for col in ("domain TEXT DEFAULT ''", "domain_embedding TEXT"):
@@ -774,8 +785,9 @@ def search_messages(session_id, q_emb, top_k=5, max_distance=1.5):
 
 
 # ── Conclusion ──
-def create_conclusion(session_id, content, metadata=None, embedding=None):
-    conn = get_db()
+def create_conclusion(session_id, content, metadata=None, embedding=None, conn=None):
+    own_conn = conn is None
+    conn = conn or get_db()
     existing = conn.execute(
         "SELECT * FROM conclusions WHERE session_id=? AND content=?",
         (session_id, content),
@@ -789,7 +801,8 @@ def create_conclusion(session_id, content, metadata=None, embedding=None):
         (cid, session_id, content, json.dumps(metadata or {}), _ts(),
          json.dumps(embedding) if embedding else None),
     )
-    conn.commit()
+    if own_conn:
+        conn.commit()
     return get_conclusion(cid)
 
 
@@ -836,10 +849,12 @@ def get_context(session_id, q_emb, top_k=5, max_distance=1.5):
 
 def create_memory(workspace_id, type, content, user_id=None, agent_name=None,
                   importance=0.5, confidence=0.8, durability=0.5, memory_type=None,
-                  source='conversation', metadata=None, embedding=None):
+                  source='conversation', metadata=None, embedding=None, conn=None):
     """Store a memory with type (tier), memory_type (semantic), importance,
-    confidence, and durability."""
-    conn = get_db()
+    confidence, and durability. If `conn` is provided the caller owns the
+    transaction (no commit happens here)."""
+    own_conn = conn is None
+    conn = conn or get_db()
     mid = _uuid()
     metadata_json = json.dumps(metadata or {})
     emb_json = json.dumps(embedding) if embedding else None
@@ -854,7 +869,8 @@ def create_memory(workspace_id, type, content, user_id=None, agent_name=None,
          emb_json, importance, confidence, durability, 1, source,
          metadata_json, _ts(), _ts()),
     )
-    conn.commit()
+    if own_conn:
+        conn.commit()
     return get_memory(mid)
 
 
@@ -874,11 +890,16 @@ def _norm(text):
 
 
 def _store_classified(table, workspace_id, content, mem_type, importance, confidence,
-                     durability, source='deriver_llm', metadata=None, embedding=None, cap=100):
+                     durability, source='deriver_llm', metadata=None, embedding=None,
+                     cap=100, conn=None):
     """Dedup (normalized + fuzzy) + capped insert into behaviour / preferences / rules tables.
     Rows beyond the cap are DEMOTED to the memories table (as cold_memory)
-    instead of being deleted, so nothing is ever lost."""
-    conn = get_db()
+    instead of being deleted, so nothing is ever lost.
+
+    If `conn` is provided the caller owns the transaction (no commit happens
+    here); otherwise the default thread-local connection is used and committed."""
+    own_conn = conn is None
+    conn = conn or get_db()
     norm = _norm(content)
     existing = conn.execute(
         f"SELECT id, content FROM {table} WHERE workspace_id=?",
@@ -921,7 +942,8 @@ def _store_classified(table, workspace_id, content, mem_type, importance, confid
             conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
         except Exception:
             pass
-    conn.commit()
+    if own_conn:
+        conn.commit()
     return conn.execute(f"SELECT * FROM {table} WHERE id=?", (mid,)).fetchone()
 
 
@@ -971,21 +993,24 @@ def dedup_classified(table, workspace_id):
 
 
 def create_behaviour(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
-                     metadata=None, embedding=None, cap=100):
+                     metadata=None, embedding=None, cap=100, conn=None):
     return _store_classified("behaviour", workspace_id, content, "behaviour", importance,
-                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+                             confidence, durability, metadata=metadata, embedding=embedding,
+                             cap=cap, conn=conn)
 
 
 def create_preference(workspace_id, content, importance=0.9, confidence=0.8, durability=0.9,
-                      metadata=None, embedding=None, cap=100):
+                      metadata=None, embedding=None, cap=100, conn=None):
     return _store_classified("preferences", workspace_id, content, "preference", importance,
-                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+                             confidence, durability, metadata=metadata, embedding=embedding,
+                             cap=cap, conn=conn)
 
 
 def create_rule(workspace_id, content, importance=1.0, confidence=0.9, durability=0.95,
-                metadata=None, embedding=None, cap=100):
+                metadata=None, embedding=None, cap=100, conn=None):
     return _store_classified("rules", workspace_id, content, "rule", importance,
-                             confidence, durability, metadata=metadata, embedding=embedding, cap=cap)
+                             confidence, durability, metadata=metadata, embedding=embedding,
+                             cap=cap, conn=conn)
 
 
 def list_classified(table, workspace_id, limit=100):
@@ -1011,10 +1036,12 @@ def get_rules(workspace_id, limit=100):
 
 def upsert_user(workspace_id, name=None, age=None, location=None, username=None,
                 email=None, occupation=None, education=None, interests=None,
-                mood=None, github=None, timezone=None, metadata=None):
+                mood=None, github=None, timezone=None, metadata=None, conn=None):
     """Create or update the single user row for a workspace. Existing non-empty
-    fields are preserved when the new value is empty."""
-    conn = get_db()
+    fields are preserved when the new value is empty.
+    If `conn` is provided the caller owns the transaction."""
+    own_conn = conn is None
+    conn = conn or get_db()
     existing = conn.execute("SELECT id FROM users WHERE workspace_id=?", (workspace_id,)).fetchone()
     uid = existing["id"] if existing else _uuid()
     meta_json = json.dumps(metadata or {})
@@ -1042,7 +1069,8 @@ def upsert_user(workspace_id, name=None, age=None, location=None, username=None,
          mood or '', github or '', timezone or '',
          meta_json, _ts(), _ts()),
     )
-    conn.commit()
+    if own_conn:
+        conn.commit()
     return get_user(workspace_id)
 
 
@@ -1053,9 +1081,12 @@ def get_user(workspace_id):
 
 
 def create_agent_written_memory(workspace_id, content, memory_type="agent_note", importance=0.6,
-                                confidence=0.8, durability=0.5, metadata=None, embedding=None):
-    """Store a memory written by the agent itself (agent_written_memory)."""
-    conn = get_db()
+                                confidence=0.8, durability=0.5, metadata=None, embedding=None,
+                                conn=None):
+    """Store a memory written by the agent itself (agent_written_memory).
+    If `conn` is provided the caller owns the transaction."""
+    own_conn = conn is None
+    conn = conn or get_db()
     mid = _uuid()
     conn.execute(
         """INSERT INTO agent_written_memory
@@ -1065,7 +1096,8 @@ def create_agent_written_memory(workspace_id, content, memory_type="agent_note",
         (mid, workspace_id, content, memory_type, importance, confidence, durability,
          json.dumps(metadata or {}), json.dumps(embedding) if embedding else None, _ts(), _ts()),
     )
-    conn.commit()
+    if own_conn:
+        conn.commit()
     row = conn.execute("SELECT * FROM agent_written_memory WHERE id=?", (mid,)).fetchone()
     return parse_row(row)
 
@@ -1075,6 +1107,337 @@ def list_agent_written_memories(workspace_id, limit=50):
     return [parse_row(r) for r in conn.execute(
         "SELECT * FROM agent_written_memory WHERE workspace_id=? ORDER BY created_at DESC LIMIT ?",
         (workspace_id, limit),
+    ).fetchall()]
+
+
+# ── Memory curation (LLM function-calling) ──
+
+# Tables the curation tools are allowed to touch.
+MEMORY_TABLES = frozenset({
+    "memories", "behaviour", "preferences", "rules", "users", "agent_written_memory",
+})
+
+# singular type value stored in the `type` column of the classified tables
+_CLASSIFIED_TABLES = {"behaviour": "behaviour", "preferences": "preference", "rules": "rule"}
+
+# Per-table columns the curation tools may update (embedding is JSON-serialized).
+_MEMORY_COLUMNS = {
+    "memories": {
+        "content", "type", "memory_type", "importance", "confidence", "durability",
+        "source", "metadata", "user_id", "agent_name", "embedding",
+    },
+    "behaviour": {"content", "type", "importance", "confidence", "durability",
+                  "source", "metadata", "embedding"},
+    "preferences": {"content", "type", "importance", "confidence", "durability",
+                    "source", "metadata", "embedding"},
+    "rules": {"content", "type", "importance", "confidence", "durability",
+              "source", "metadata", "embedding"},
+    "users": {"name", "age", "location", "username", "email", "occupation",
+              "education", "interests", "mood", "github", "timezone", "metadata"},
+    "agent_written_memory": {"content", "memory_type", "importance", "confidence",
+                             "durability", "source", "metadata", "embedding"},
+}
+
+
+def _validate_memory_table(table):
+    if table not in MEMORY_TABLES:
+        raise ValueError(
+            f"invalid memory table '{table}'; allowed: {sorted(MEMORY_TABLES)}"
+        )
+
+
+def _ensure_curation_audit(conn):
+    """Create curation_audit lazily so long-lived processes pick up the table
+    even when the process-wide schema guard already ran."""
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS curation_audit (
+                   id TEXT PRIMARY KEY,
+                   action TEXT NOT NULL,
+                   table_name TEXT NOT NULL,
+                   row_id TEXT,
+                   content TEXT DEFAULT '',
+                   reason TEXT DEFAULT '',
+                   detail TEXT DEFAULT '{}',
+                   created_at TEXT NOT NULL
+               )"""
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _audit(conn, action, table, row_id, content, reason, detail=None):
+    _ensure_curation_audit(conn)
+    conn.execute(
+        """INSERT INTO curation_audit
+           (id, action, table_name, row_id, content, reason, detail, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (_uuid(), action, table, str(row_id), (content or "")[:500], reason or "",
+         json.dumps(detail or {}), _ts()),
+    )
+
+
+def _row_by_id_or_rowid(conn, table, row_id):
+    """Fetch a row by its TEXT id, falling back to the integer rowid."""
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (str(row_id),)).fetchone()
+    if row is None:
+        try:
+            row = conn.execute(f"SELECT * FROM {table} WHERE rowid=?", (int(row_id),)).fetchone()
+        except (TypeError, ValueError):
+            pass
+    return row
+
+
+def _load_metadata(raw):
+    try:
+        meta = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _load_embedding(raw):
+    try:
+        emb = json.loads(raw) if raw else None
+    except (json.JSONDecodeError, TypeError):
+        emb = raw
+    return emb
+
+
+def _user_summary(row):
+    """Build a standalone content string from a structured users row."""
+    labels = (
+        ("name", "name"), ("age", "age"), ("location", "location"),
+        ("username", "username"), ("email", "email"), ("occupation", "occupation"),
+        ("education", "education"), ("interests", "interests"), ("mood", "mood"),
+        ("github", "github"),
+    )
+    parts = [f"{label}: {row.get(key) or ''}" for key, label in labels if row.get(key)]
+    return "User profile — " + "; ".join(parts) if parts else "User profile — (empty)"
+
+
+def _move_row(conn, source_table, row, target_table, reason):
+    """Copy a row into `target_table`, stamp the curation reason into its
+    metadata, and return (new_row_id, must_delete_source)."""
+    rid = row.get("id")
+    workspace_id = row.get("workspace_id")
+    content = (row.get("content") or "").strip() or _user_summary(row)
+    importance = float(row.get("importance") if row.get("importance") is not None else 0.5)
+    confidence = float(row.get("confidence") if row.get("confidence") is not None else 0.8)
+    durability = float(row.get("durability") if row.get("durability") is not None else 0.5)
+    src_meta = _load_metadata(row.get("metadata"))
+    src_meta["curation"] = {
+        "action": "moved",
+        "moved_from": source_table,
+        "reason": reason or "",
+        "moved_at": _ts(),
+    }
+    embedding = _load_embedding(row.get("embedding"))
+    new_id = _uuid()
+    now = _ts()
+
+    if target_table == "memories":
+        if source_table == "memories":
+            # Re-categorize a memory row in place (tier change).
+            mem_type = row.get("type") or "cold_memory"
+            conn.execute(
+                "UPDATE memories SET type=?, metadata=?, updated_at=? WHERE id=?",
+                (mem_type, json.dumps(src_meta), now, rid),
+            )
+            return rid, False
+        memory_type = row.get("memory_type") or (
+            "agent_note" if source_table == "agent_written_memory" else source_table
+        )
+        conn.execute(
+            """INSERT INTO memories
+               (id, workspace_id, user_id, agent_name, type, memory_type, content,
+                embedding, importance, confidence, durability, observed_count, source,
+                metadata, created_at, updated_at)
+               VALUES (?, ?, '', '', 'cold_memory', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+            (new_id, workspace_id, memory_type, content,
+             json.dumps(embedding) if embedding else None,
+             importance, confidence, durability,
+             row.get("source") or "deriver_llm", json.dumps(src_meta), now, now),
+        )
+        return new_id, True
+
+    if target_table in _CLASSIFIED_TABLES:
+        mem_type = _CLASSIFIED_TABLES[target_table]
+        conn.execute(
+            f"""INSERT INTO {target_table}
+                (id, workspace_id, content, type, importance, confidence, durability,
+                 source, metadata, embedding, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_id, workspace_id, content, mem_type, importance, confidence, durability,
+             row.get("source") or "deriver_llm", json.dumps(src_meta),
+             json.dumps(embedding) if embedding else None, now, now),
+        )
+        return new_id, True
+
+    if target_table == "agent_written_memory":
+        memory_type = row.get("memory_type") or (
+            "agent_note" if source_table == "agent_written_memory" else
+            ("preference" if source_table == "preferences" else source_table)
+        )
+        conn.execute(
+            """INSERT INTO agent_written_memory
+               (id, workspace_id, content, memory_type, importance, confidence, durability,
+                source, metadata, embedding, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?)""",
+            (new_id, workspace_id, content, memory_type, importance, confidence, durability,
+             json.dumps(src_meta), json.dumps(embedding) if embedding else None, now, now),
+        )
+        return new_id, True
+
+    raise ValueError(f"moving rows into '{target_table}' is not supported")
+
+
+def add_memory_row(table, workspace_id, fields, conn=None):
+    """Insert a single row into one of the memory tables (used by the
+    add_memory_rows LLM tool). `fields` uses the same keys as the tool JSON
+    schema. If `conn` is provided the caller owns the transaction."""
+    _validate_memory_table(table)
+    fields = fields or {}
+    content = str(fields.get("content") or "").strip()
+    if not content and table != "users":
+        raise ValueError(f"'content' is required for table '{table}'")
+    importance = float(fields.get("importance", 0.6) if fields.get("importance") is not None else 0.6)
+    confidence = float(fields.get("confidence", 0.8) if fields.get("confidence") is not None else 0.8)
+    durability = float(fields.get("durability", 0.5) if fields.get("durability") is not None else 0.5)
+    metadata = fields.get("metadata") or {}
+    embedding = fields.get("embedding")
+
+    if table == "memories":
+        tier = str(fields.get("type") or "cold_memory")
+        if tier not in ("hot_memory", "cold_memory"):
+            semantic = str(fields.get("memory_type") or tier)
+            tier = "cold_memory"
+        else:
+            semantic = str(fields.get("memory_type") or "note")
+        return create_memory(
+            workspace_id, type=tier, content=content,
+            importance=importance, confidence=confidence, durability=durability,
+            memory_type=semantic, source=str(fields.get("source") or "deriver_llm"),
+            metadata=metadata, embedding=embedding, conn=conn,
+        )
+    if table in _CLASSIFIED_TABLES:
+        return _store_classified(
+            table, workspace_id, content, _CLASSIFIED_TABLES[table],
+            importance, confidence, durability,
+            source=str(fields.get("source") or "deriver_llm"),
+            metadata=metadata, embedding=embedding, conn=conn,
+        )
+    if table == "agent_written_memory":
+        return create_agent_written_memory(
+            workspace_id, content,
+            memory_type=str(fields.get("memory_type") or "agent_note"),
+            importance=importance, confidence=confidence, durability=durability,
+            metadata=metadata, embedding=embedding, conn=conn,
+        )
+    if table == "users":
+        return upsert_user(
+            workspace_id,
+            name=fields.get("name"), age=fields.get("age"),
+            location=fields.get("location"), username=fields.get("username"),
+            email=fields.get("email"), occupation=fields.get("occupation"),
+            education=fields.get("education"), interests=fields.get("interests"),
+            mood=fields.get("mood"), github=fields.get("github"),
+            timezone=fields.get("timezone"), metadata=metadata, conn=conn,
+        )
+    raise ValueError(f"unsupported memory table '{table}'")
+
+
+def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="", conn=None):
+    """Update an existing memory row, or move it to another table.
+
+    - table: one of MEMORY_TABLES the row currently lives in.
+    - row_id: the row's TEXT id (or integer rowid).
+    - fields: columns to change (validated against _MEMORY_COLUMNS[table]).
+    - move_to_table: when given, the row is copied into that table (content,
+      importance, confidence, durability, embedding, metadata) and then deleted
+      from the source table; the reason is recorded in the curation_audit log
+      and stamped into the moved row's metadata.
+    - reason: required for auditability; recorded in curation_audit.
+
+    If `conn` is provided the caller owns the transaction (no commit here).
+    """
+    _validate_memory_table(table)
+    if move_to_table:
+        _validate_memory_table(move_to_table)
+        if move_to_table == "users":
+            raise ValueError("moving rows into 'users' is not supported; update the user row via fields instead")
+    fields = fields or {}
+    own_conn = conn is None
+    conn = conn or get_db()
+
+    row = _row_by_id_or_rowid(conn, table, row_id)
+    if row is None:
+        return {"ok": False, "error": f"row {row_id!r} not found in '{table}'",
+                "table": table, "row_id": row_id, "action": "missing"}
+    row = dict(row)
+    rid = row.get("id") or row_id
+
+    if move_to_table and move_to_table != table:
+        new_id, delete_source = _move_row(conn, table, row, move_to_table, reason)
+        if delete_source:
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+        _audit(conn, "move", table, rid, row.get("content"), reason,
+               {"to": move_to_table, "new_row_id": new_id})
+        if own_conn:
+            conn.commit()
+        return {"ok": True, "action": "moved", "table": table, "row_id": rid,
+                "move_to_table": move_to_table, "new_row_id": new_id, "reason": reason}
+
+    allowed = _MEMORY_COLUMNS[table]
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return {"ok": False, "error": "no valid fields to update",
+                "table": table, "row_id": rid, "action": "noop"}
+
+    sets, params = [], []
+    for k, v in updates.items():
+        if k == "embedding":
+            v = json.dumps(v) if v is not None else None
+        elif isinstance(v, (dict, list)):
+            v = json.dumps(v)
+        sets.append(f"{k}=?")
+        params.append(v)
+    params.append(_ts())
+    params.append(rid)
+    conn.execute(f"UPDATE {table} SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
+    _audit(conn, "update", table, rid, row.get("content"), reason,
+           {"fields": sorted(updates.keys())})
+    if own_conn:
+        conn.commit()
+    return {"ok": True, "action": "updated", "table": table, "row_id": rid,
+            "fields": sorted(updates.keys()), "reason": reason}
+
+
+def delete_memory_row(table, row_id, reason="", conn=None):
+    """Hard-delete a memory row from one of the memory tables. The reason is
+    logged to curation_audit (the content is kept in the audit row)."""
+    _validate_memory_table(table)
+    own_conn = conn is None
+    conn = conn or get_db()
+
+    row = _row_by_id_or_rowid(conn, table, row_id)
+    if row is None:
+        return {"ok": False, "error": f"row {row_id!r} not found in '{table}'",
+                "table": table, "row_id": row_id, "action": "missing"}
+    row = dict(row)
+    rid = row["id"]
+    conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+    _audit(conn, "delete", table, rid, row.get("content"), reason)
+    if own_conn:
+        conn.commit()
+    return {"ok": True, "action": "deleted", "table": table, "row_id": rid, "reason": reason}
+
+
+def list_curation_audit(limit=100):
+    """Recent curation actions (updates / moves / deletes) for observability."""
+    conn = get_db()
+    return [parse_row(r) for r in conn.execute(
+        "SELECT * FROM curation_audit ORDER BY created_at DESC LIMIT ?", (limit,)
     ).fetchall()]
 
 
