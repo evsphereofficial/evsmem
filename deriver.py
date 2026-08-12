@@ -56,6 +56,12 @@ SYNC_INTERVAL = max(float(os.getenv("EVSMEM_SYNC_INTERVAL", "30")), 5.0)
 # Batch window (hours) used on the FIRST run before any analysis cursor exists.
 BATCH_WINDOW_HOURS = float(os.getenv("EVSMEM_BATCH_HOURS", "1"))
 
+# Max messages per single LLM analysis invocation. The batch is capped (oldest
+# rowids first) so one hourly pass stays bounded even after a long outage; the
+# analysis cursor advances to the newest processed message, so the remainder is
+# picked up by the next pass (chunked catch-up, never lost, never double-run).
+BATCH_MAX_MSGS = int(os.getenv("EVSMEM_BATCH_MAX_MSGS", "300"))
+
 # Remote LLM (DeepSeek) is preferred when available; the local GGUF LLMClient
 # is the fallback. DeepSeekClient is owned by llm_client.py (parallel work) —
 # import defensively so this module works with or without it.
@@ -265,6 +271,35 @@ def _empty_tool_stats() -> dict:
             "applied": False, "rounds": 0}
 
 
+def _parse_db_ts(value) -> Optional[datetime]:
+    """Parse a `created_at` value from the DB into an aware UTC datetime.
+
+    Handles the mixed formats that exist in the messages table:
+      - ISO-8601:  "2025-01-20T10:30:00.123456+00:00" (crud._ts, deriver sync)
+      - SQLite:    "2025-01-20 10:30:00"              (datetime('now'), legacy)
+      - Naive ISO: "2025-01-20T10:30:00"              (treated as UTC)
+
+    Returns None when the value is missing or unparseable. Callers that cannot
+    date a row include it conservatively rather than dropping it.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # SQLite datetime('now') uses a space separator; ISO-8601 requires 'T'.
+    text = text.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
 def _is_workflow_noise(text):
     """True if the content looks like ev-agent's internal workflow/architecture
     instructions (system-prompt or subagent boilerplate) that must NEVER be
@@ -338,42 +373,60 @@ class Deriver:
 
     def _get_hour_batch(self) -> list[dict]:
         """All unprocessed messages accumulated since the previous successful
-        analysis pass — a rolling 1-hour window (no LIMIT), oldest first.
+        analysis pass — a rolling window (rowid ASC, capped at
+        EVSMEM_BATCH_MAX_MSGS so one LLM call stays bounded), oldest first.
 
-        On the first run the window defaults to the last `BATCH_WINDOW_HOURS`
-        (default 1). Messages younger than 30 seconds are excluded so streamed
-        messages settle first. The window cursor (`deriver_state.last_analysis_at`)
-        only advances on a successful pass, so after an LLM failure the same
-        batch is left unprocessed and retried on the next run.
+        - On the first run (no analysis cursor) the window defaults to the last
+          `EVSMEM_BATCH_HOURS` (default 1).
+        - Messages younger than 30 seconds are excluded so streamed messages
+          settle first.
+        - `created_at` is parsed with datetime.fromisoformat instead of raw
+          string comparison, so legacy rows with SQLite space-separator
+          timestamps ("YYYY-MM-DD HH:MM:SS") are still placed in the correct
+          hour window alongside ISO-8601 rows. Rows with an unparseable
+          timestamp are included conservatively (processed once, then marked).
+        - The window cursor (`deriver_state.last_analysis_at`) only advances
+          on a successful pass, so after an LLM failure the same batch is left
+          unprocessed and retried on the next run.
         """
         window_hours = float(os.getenv("EVSMEM_BATCH_HOURS", str(BATCH_WINDOW_HOURS)))
+        max_msgs = int(os.getenv("EVSMEM_BATCH_MAX_MSGS", str(BATCH_MAX_MSGS)))
         conn = get_db()
         try:
             cursor = conn.execute(
                 "SELECT value FROM deriver_state WHERE key='last_analysis_at'"
             ).fetchone()
 
-            sql = """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
-                            s.workspace_id, m.metadata
-                     FROM messages m
-                     JOIN sessions s ON m.session_id = s.id
-                     WHERE m.is_processed = 0 AND m.content != ''
-                       AND m.created_at <= ?"""
-            params: list = [(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()]
-            if cursor and cursor["value"]:
-                # Rolling window: messages created after the last successful pass.
-                sql += " AND m.created_at > ?"
-                params.append(cursor["value"])
-            else:
-                # First run: the last hour (or EVSMEM_BATCH_HOURS if set).
-                sql += " AND m.created_at >= ?"
-                params.append((datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat())
-            sql += " ORDER BY m.rowid ASC"
+            now = datetime.now(timezone.utc)
+            upper = now - timedelta(seconds=30)
+            cursor_dt = _parse_db_ts(cursor["value"]) if cursor else None
+            lower = cursor_dt if cursor_dt else (now - timedelta(hours=window_hours))
 
-            rows = conn.execute(sql, params).fetchall()
+            # Conservative SQL lower bound (a true superset of the Python
+            # window, independent of timestamp format): the date prefix is the
+            # same leading 10 chars for both ISO-8601 and SQLite formats, so
+            # `substr(...,1,10) >= ?` never excludes a row the Python filter
+            # would keep — it just keeps the candidate fetch small.
+            date_lower = (lower - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            rows = conn.execute(
+                """SELECT m.rowid, m.id, m.content, m.role, m.session_id,
+                          s.workspace_id, m.metadata, m.created_at
+                   FROM messages m
+                   JOIN sessions s ON m.session_id = s.id
+                   WHERE m.is_processed = 0 AND m.content != ''
+                     AND (m.created_at IS NULL OR substr(m.created_at, 1, 10) >= ?)
+                   ORDER BY m.rowid ASC""",
+                (date_lower,),
+            ).fetchall()
 
             out = []
             for r in rows:
+                ts = _parse_db_ts(r["created_at"])
+                # Unparseable timestamps are kept (conservative) so no message
+                # is silently dropped; they are marked processed after success.
+                if ts is not None and not (lower <= ts <= upper):
+                    continue  # outside the rolling window (or pre-cursor)
                 meta = {}
                 try:
                     meta = json.loads(r["metadata"] or "{}")
@@ -387,7 +440,11 @@ class Deriver:
                     "session_id": r["session_id"],
                     "workspace_id": r["workspace_id"],
                     "is_subagent": bool(meta.get("is_subagent", False)),
+                    "created_at": r["created_at"],
                 })
+                if len(out) >= max_msgs:
+                    logger.info(f"Hour batch capped at {max_msgs} messages")
+                    break
             return out
         finally:
             conn.close()
@@ -427,26 +484,64 @@ class Deriver:
         finally:
             conn.close()
 
-    def _advance_analysis_cursor(self):
+    def _advance_analysis_cursor(self, at: Optional[str] = None):
         """Record the successful analysis time so the next pass only picks up
-        messages written after it (idempotent rolling window)."""
+        messages written after it (idempotent rolling window).
+
+        `at` should be the ISO timestamp of the NEWEST message in the processed
+        batch (not wall-clock now): any message that arrived while the LLM call
+        was running has a later created_at and is therefore picked up by the
+        next pass instead of being skipped forever. Defaults to now, which is
+        only correct when the batch was empty.
+        """
         now = datetime.now(timezone.utc).isoformat()
+        value = at or now
         conn = get_db()
         try:
             conn.execute(
                 """INSERT OR REPLACE INTO deriver_state (key, value, updated_at)
                    VALUES ('last_analysis_at', ?, ?)""",
-                (now, now),
+                (value, now),
             )
             conn.commit()
         finally:
             conn.close()
 
+    def _newest_batch_ts(self, batches: dict[str, list[dict]]) -> Optional[str]:
+        """ISO timestamp of the newest message in the processed batches, used
+        as the rolling-window cursor. Returns None when no batch message has a
+        parseable created_at (caller then falls back to advancing to now)."""
+        newest: Optional[datetime] = None
+        for batch in batches.values():
+            for m in batch:
+                ts = _parse_db_ts(m.get("created_at"))
+                if ts is not None and (newest is None or ts > newest):
+                    newest = ts
+        if newest is None:
+            return None
+        now = datetime.now(timezone.utc)
+        if newest > now:  # clamp clock skew so the cursor never sits in the future
+            newest = now
+        return newest.isoformat()
+
     # ── LLM Processing Pipeline ──
 
     def _get_llm(self):
         """Return (engine, llm): remote DeepSeek when available (with tool
-        calling), otherwise the local GGUF LLMClient fallback."""
+        calling), otherwise the local GGUF LLMClient fallback.
+
+        Selection rules:
+          - Remote DeepSeekClient is preferred when the ``evsmem_llm_api_key``
+            env var is set AND ``DeepSeekClient.is_available()`` is True. Any
+            per-call remote failure (network, auth, rate-limit, timeout, JSON
+            error) is handled INSIDE the client, which transparently falls back
+            to the local GGUF model for that call — the deriver never crashes.
+          - When the key is unset, the client init raises, or
+            ``is_available()`` is False, the local GGUF LLMClient is used
+            directly.
+        The chosen provider is logged per pass (remote/local/none) so the
+        engine driving each analysis is attributable.
+        """
         from llm_client import LLMClient
 
         if DeepSeekClient is not None:
@@ -454,14 +549,31 @@ class Deriver:
                 llm = DeepSeekClient()
                 available = getattr(llm, "is_available", None)
                 if available is None or available():
-                    logger.info("Using remote DeepSeek client for memory analysis")
+                    logger.info(
+                        "provider=remote model=%s client=%s",
+                        getattr(llm, "model_name", lambda: "?")() or "?",
+                        type(llm).__name__,
+                    )
                     return "remote", llm
+                logger.info(
+                    "provider=remote-unavailable model=%s (is_available()=False) — "
+                    "falling back to local GGUF",
+                    getattr(llm, "model_name", lambda: "?")() or "?",
+                )
             except Exception as e:
-                logger.warning(f"DeepSeek client failed to initialize: {e}")
+                logger.warning(
+                    "provider=remote-init-failed error=%s — falling back to local GGUF", e
+                )
 
         llm = LLMClient()
         if llm.is_available():
+            logger.info(
+                "provider=local model=%s client=%s",
+                getattr(llm, "model_name", lambda: "?")() or "?",
+                type(llm).__name__,
+            )
             return "local", llm
+        logger.warning("provider=none — remote unavailable AND local GGUF model missing")
         return None, None
 
     def _process_new_messages_with_llm(self, stats: dict) -> bool:
@@ -506,7 +618,10 @@ class Deriver:
             # Post-pass success path: only now mark the whole batch processed.
             all_rowids = [m["rowid"] for batch in batches.values() for m in batch]
             self._mark_messages_processed(all_rowids)
-            self._advance_analysis_cursor()
+            # Advance the cursor to the newest processed message, NOT to
+            # wall-clock now — messages that arrived while the LLM call was
+            # running stay ahead of the cursor and are curated next pass.
+            self._advance_analysis_cursor(at=self._newest_batch_ts(batches))
             return True
         except Exception:
             # Leave messages unprocessed and the cursor unadvanced → retried next run.
@@ -795,7 +910,7 @@ class Deriver:
                     res = _crud.update_memory_row(
                         args.get("table"), args.get("row_id"),
                         args.get("fields") or {}, args.get("move_to_table"),
-                        args.get("reason") or "", conn=conn,
+                        args.get("reason") or "", workspace_id=workspace_id, conn=conn,
                     )
                     if res.get("ok"):
                         if res.get("action") == "moved":
@@ -806,7 +921,7 @@ class Deriver:
                 elif name == "delete_memory_row":
                     res = _crud.delete_memory_row(
                         args.get("table"), args.get("row_id"),
-                        args.get("reason") or "", conn=conn,
+                        args.get("reason") or "", workspace_id=workspace_id, conn=conn,
                     )
                     if res.get("ok"):
                         stats["deleted"] += 1
@@ -1907,22 +2022,75 @@ class Deriver:
         logger.info("deriver_analysis_pass " + json.dumps(stats, default=str))
         return synced
 
+    def _last_analysis_at(self) -> Optional[datetime]:
+        """Timestamp of the last SUCCESSFUL analysis pass, read from
+        deriver_state.last_analysis_at. Returns None when no pass has ever
+        succeeded (first run) or the stored value is unparseable — callers then
+        treat the window as due."""
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT value FROM deriver_state WHERE key='last_analysis_at'"
+            ).fetchone()
+            return _parse_db_ts(row["value"]) if row else None
+        finally:
+            conn.close()
+
+    def _seconds_until_next_window(self) -> float:
+        """Seconds remaining in the current 60-minute analysis window, based on
+        the last successful analysis pass.
+
+        Returns 0.0 when a pass is due right now (first run ever, or the last
+        pass is older than EVSMEM_DERIVE_INTERVAL). Otherwise the scheduler
+        waits out the remainder of the window so the LLM is never invoked twice
+        for the same hour (idempotent session-start trigger).
+        """
+        last = self._last_analysis_at()
+        if last is None:
+            return 0.0
+        age = (datetime.now(timezone.utc) - last).total_seconds()
+        return max(0.0, DERIVE_INTERVAL - age)
+
     def run_forever(self):
-        """Idempotent scheduler: one analysis pass immediately at start, then
-        once per EVSMEM_DERIVE_INTERVAL (default 60 minutes). A threading.Lock
+        """Idempotent scheduler: one analysis pass at session start, then once
+        per EVSMEM_DERIVE_INTERVAL (default 60 minutes). A threading.Lock
         prevents overlapping passes. Message sync (upsert by source id) keeps
         running every EVSMEM_SYNC_INTERVAL between analysis passes so new
-        messages flow into evsmem without triggering the LLM."""
+        messages flow into evsmem without triggering the LLM.
+
+        Session-start trigger is idempotent: the immediate pass is skipped when
+        a successful analysis already ran inside the current hour window (e.g.
+        the app restarted mid-hour) — the batch is then picked up at the next
+        hour boundary. This guarantees the LLM is invoked at most once per
+        60-minute window plus one catch-up pass on the first ever run.
+        """
         self._running = True
-        logger.info(
-            f"Deriver started (analysis pass now, then every {DERIVE_INTERVAL:.0f}s; "
-            f"message sync every {SYNC_INTERVAL:.0f}s)"
-        )
-        next_analysis = 0.0
+        # Session-start idempotency check: fire now only if the window is due.
+        skip_for = self._seconds_until_next_window()
+        if skip_for > 0.0:
+            next_analysis = time.monotonic() + skip_for
+            logger.info(
+                "Deriver session-start trigger SKIPPED — last analysis pass ran "
+                "%.0fs ago inside the %.0fs hour window; messages keep syncing, "
+                "next analysis at the hour boundary in %.0fs",
+                DERIVE_INTERVAL - skip_for, DERIVE_INTERVAL, skip_for,
+            )
+        else:
+            next_analysis = 0.0
+            logger.info(
+                "Deriver session-start trigger FIRED — analysis window is due "
+                "(first run or last pass older than %.0fs)",
+                DERIVE_INTERVAL,
+            )
         while self._running:
             if time.monotonic() >= next_analysis:
                 if self._analysis_lock.acquire(blocking=False):
                     try:
+                        logger.info(
+                            "Deriver: hourly analysis window fired — running one "
+                            "batched curation pass (interval %.0fs)",
+                            DERIVE_INTERVAL,
+                        )
                         self.run_once()
                     except Exception as e:
                         logger.error(f"Deriver pass error: {e}", exc_info=True)

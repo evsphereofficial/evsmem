@@ -1112,9 +1112,12 @@ def list_agent_written_memories(workspace_id, limit=50):
 
 # ── Memory curation (LLM function-calling) ──
 
-# Tables the curation tools are allowed to touch.
+# Tables the curation tools are allowed to touch. "conclusions" is included
+# for delete/update/get even though it is session-scoped (no workspace_id
+# column) — workspace scope for it is resolved through the owning session.
 MEMORY_TABLES = frozenset({
     "memories", "behaviour", "preferences", "rules", "users", "agent_written_memory",
+    "conclusions",
 })
 
 # singular type value stored in the `type` column of the classified tables
@@ -1136,6 +1139,8 @@ _MEMORY_COLUMNS = {
               "education", "interests", "mood", "github", "timezone", "metadata"},
     "agent_written_memory": {"content", "memory_type", "importance", "confidence",
                              "durability", "source", "metadata", "embedding"},
+    # conclusions is session-scoped and has no updated_at/importance columns.
+    "conclusions": {"content", "metadata", "embedding"},
 }
 
 
@@ -1186,6 +1191,80 @@ def _row_by_id_or_rowid(conn, table, row_id):
         except (TypeError, ValueError):
             pass
     return row
+
+
+def _row_workspace_id(conn, table, row):
+    """Workspace a row belongs to. The memory tables carry workspace_id
+    directly; conclusions are session-scoped, so resolve them through the
+    owning session."""
+    if row is None:
+        return None
+    if "workspace_id" in row.keys() and row["workspace_id"] is not None:
+        return row["workspace_id"]
+    if table == "conclusions":
+        if "session_id" not in row.keys():
+            return None
+        sid = row["session_id"]
+        if sid is None:
+            return None
+        s = conn.execute("SELECT workspace_id FROM sessions WHERE id=?", (sid,)).fetchone()
+        return s["workspace_id"] if s else None
+    return None
+
+
+def _scoped_row(conn, table, row_id, workspace_id=None):
+    """Fetch a row by id (or rowid), optionally scoped to a workspace.
+    Returns None when the row is missing OR when it belongs to a different
+    workspace than the one requested."""
+    row = _row_by_id_or_rowid(conn, table, row_id)
+    if row is not None and workspace_id is not None:
+        if _row_workspace_id(conn, table, row) != workspace_id:
+            row = None
+    return row
+
+
+def get_memory_row(table, row_id, workspace_id=None, conn=None):
+    """Fetch a single row by id (or integer rowid) from one of the memory
+    tables for inspection by the LLM before updating/deleting it. Returns a
+    parsed dict or None.
+
+    - workspace_id: optional. When given, the lookup is scoped to that
+      workspace (conclusions are resolved through their owning session) — a
+      row from another workspace returns None.
+    """
+    _validate_memory_table(table)
+    conn = conn or get_db()
+    row = _scoped_row(conn, table, row_id, workspace_id)
+    return parse_row(row) if row is not None else None
+
+
+def list_memory_rows(table, workspace_id=None, limit=50, conn=None):
+    """List rows from one of the memory tables for inspection (newest first).
+    Use get_memory_row() to inspect a specific row before updating/deleting it.
+
+    - workspace_id: optional. When given, only rows in that workspace are
+      returned (conclusions are resolved through their owning session).
+    """
+    _validate_memory_table(table)
+    conn = conn or get_db()
+    limit = max(1, int(limit))
+    if table == "conclusions":
+        if workspace_id is not None:
+            return [parse_row(r) for r in conn.execute(
+                """SELECT c.* FROM conclusions c
+                   JOIN sessions s ON c.session_id = s.id
+                   WHERE s.workspace_id=? ORDER BY c.created_at DESC LIMIT ?""",
+                (workspace_id, limit)).fetchall()]
+        return [parse_row(r) for r in conn.execute(
+            "SELECT * FROM conclusions ORDER BY created_at DESC LIMIT ?",
+            (limit,)).fetchall()]
+    if workspace_id is not None:
+        return [parse_row(r) for r in conn.execute(
+            f"SELECT * FROM {table} WHERE workspace_id=? ORDER BY created_at DESC LIMIT ?",
+            (workspace_id, limit)).fetchall()]
+    return [parse_row(r) for r in conn.execute(
+        f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT ?",
+        (limit,)).fetchall()]
 
 
 def _load_metadata(raw):
@@ -1347,7 +1426,8 @@ def add_memory_row(table, workspace_id, fields, conn=None):
     raise ValueError(f"unsupported memory table '{table}'")
 
 
-def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="", conn=None):
+def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="",
+                      workspace_id=None, conn=None):
     """Update an existing memory row, or move it to another table.
 
     - table: one of MEMORY_TABLES the row currently lives in.
@@ -1358,6 +1438,9 @@ def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="",
       from the source table; the reason is recorded in the curation_audit log
       and stamped into the moved row's metadata.
     - reason: required for auditability; recorded in curation_audit.
+    - workspace_id: optional. When given, the row lookup is scoped to that
+      workspace (conclusions are resolved through their owning session); a row
+      that belongs to another workspace is treated as not found.
 
     If `conn` is provided the caller owns the transaction (no commit here).
     """
@@ -1366,13 +1449,18 @@ def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="",
         _validate_memory_table(move_to_table)
         if move_to_table == "users":
             raise ValueError("moving rows into 'users' is not supported; update the user row via fields instead")
+    if table == "conclusions" and move_to_table and move_to_table != table:
+        raise ValueError("moving rows out of 'conclusions' is not supported; update content in place or delete instead")
     fields = fields or {}
     own_conn = conn is None
     conn = conn or get_db()
 
-    row = _row_by_id_or_rowid(conn, table, row_id)
+    row = _scoped_row(conn, table, row_id, workspace_id)
     if row is None:
-        return {"ok": False, "error": f"row {row_id!r} not found in '{table}'",
+        err = (f"row {row_id!r} not found in '{table}'"
+               if workspace_id is None
+               else f"row {row_id!r} not found in '{table}' for workspace '{workspace_id}'")
+        return {"ok": False, "error": err,
                 "table": table, "row_id": row_id, "action": "missing"}
     row = dict(row)
     rid = row.get("id") or row_id
@@ -1402,9 +1490,13 @@ def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="",
             v = json.dumps(v)
         sets.append(f"{k}=?")
         params.append(v)
-    params.append(_ts())
-    params.append(rid)
-    conn.execute(f"UPDATE {table} SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
+    if table == "conclusions":
+        # conclusions is session-scoped and has no updated_at column.
+        conn.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id=?", (*params, rid))
+    else:
+        params.append(_ts())
+        params.append(rid)
+        conn.execute(f"UPDATE {table} SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
     _audit(conn, "update", table, rid, row.get("content"), reason,
            {"fields": sorted(updates.keys())})
     if own_conn:
@@ -1413,16 +1505,26 @@ def update_memory_row(table, row_id, fields=None, move_to_table=None, reason="",
             "fields": sorted(updates.keys()), "reason": reason}
 
 
-def delete_memory_row(table, row_id, reason="", conn=None):
+def delete_memory_row(table, row_id, reason="", workspace_id=None, conn=None):
     """Hard-delete a memory row from one of the memory tables. The reason is
-    logged to curation_audit (the content is kept in the audit row)."""
+    logged to curation_audit (the content is kept in the audit row).
+
+    - workspace_id: optional. When given, the row lookup is scoped to that
+      workspace (conclusions are resolved through their owning session); a row
+      that belongs to another workspace is treated as not found.
+
+    If `conn` is provided the caller owns the transaction (no commit here).
+    """
     _validate_memory_table(table)
     own_conn = conn is None
     conn = conn or get_db()
 
-    row = _row_by_id_or_rowid(conn, table, row_id)
+    row = _scoped_row(conn, table, row_id, workspace_id)
     if row is None:
-        return {"ok": False, "error": f"row {row_id!r} not found in '{table}'",
+        err = (f"row {row_id!r} not found in '{table}'"
+               if workspace_id is None
+               else f"row {row_id!r} not found in '{table}' for workspace '{workspace_id}'")
+        return {"ok": False, "error": err,
                 "table": table, "row_id": row_id, "action": "missing"}
     row = dict(row)
     rid = row["id"]
