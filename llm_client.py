@@ -36,6 +36,31 @@ import urllib.request
 from pathlib import Path
 from uuid import uuid4
 
+
+def _load_dotenv(path: Path | None = None) -> None:
+    """Load a sibling ``.env`` file into ``os.environ`` (stdlib only).
+
+    Run at import time so module-level config and API-key lookups see values
+    even when the process was started without the variables exported. A real
+    environment variable always wins (``setdefault``), so this never clobbers
+    an explicitly exported value. The key/value is never logged.
+    """
+    target = path or Path(__file__).resolve().with_name(".env")
+    if not target.is_file():
+        return
+    for line in target.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
 logger = logging.getLogger("evsmem.llm_client")
 logger.setLevel(logging.INFO)
 logger.propagate = False
