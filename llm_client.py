@@ -98,7 +98,7 @@ _MODEL_LOCK = threading.Lock()
 # CLI / fetch_available_models(); when it is inaccessible the documented id is
 # used so the pipeline keeps working.
 ZEN_BASE_URL = os.getenv("EVSMEM_LLM_BASE_URL", "https://opencode.ai/zen/v1").rstrip("/")
-DEEPSEEK_MODEL = "deepseek-v4-flash-free"  # wire model id (user-verified; NO "zen/" prefix)
+DEEPSEEK_MODEL = os.getenv("EVSMEM_LLM_MODEL", "deepseek-v4-flash-free")  # wire model id (user-verified; NO "zen/" prefix)
 # API key — env var ONLY, never hardcoded, never logged.
 _API_KEY_ENV = "evsmem_llm_api_key"
 
