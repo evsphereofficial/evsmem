@@ -116,11 +116,17 @@ _RETRY_JITTER = float(os.getenv("EVSMEM_LLM_RETRY_JITTER", "0.3"))
 # short rows ever landed. Default 16384, env-configurable (the user's old
 # LLM_MAX_TOKENS=64000 never reached the remote payload — it was dead code).
 _REMOTE_MAX_TOKENS = int(os.getenv("EVSMEM_MAX_TOKENS", "16384"))
-# OPT-IN context cap: most OpenAI-compatible servers reject unknown request
-# fields, so `max_context_tokens` is only sent when EVSMEM_MAX_CONTEXT is
-# explicitly set (> 0). Default 0 = not sent (the model's native context
-# applies, e.g. 265K for the zen/DeepSeek endpoint).
-_REMOTE_MAX_CONTEXT = int(os.getenv("EVSMEM_MAX_CONTEXT", "0"))
+# Context cap sent as `max_context_tokens` — the zen endpoint accepts the
+# field (verified live: 200 OK) and it tells the backend how much room the
+# batch is allowed to use. Default 265000 (the user-approved window);
+# EVSMEM_MAX_CONTEXT=0 stops sending it (model-native context applies).
+_REMOTE_MAX_CONTEXT = int(os.getenv("EVSMEM_MAX_CONTEXT", "265000"))
+# Effort control for the effort-based reasoning model (deepseek-v4-flash-free
+# supports reasoning_effort low/high/max — there is NO full "off" level on zen:
+# models.dev declares effort-type options and upstream PR #31795 adding a
+# `none` variant is still unmerged). "low" minimizes thinking tokens so the
+# batch output budget is not eaten by reasoning_content.
+_REMOTE_REASONING_EFFORT = os.getenv("EVSMEM_REASONING_EFFORT", "low").strip()
 
 # HTTP statuses considered transient (retried with backoff).
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -334,9 +340,14 @@ class DeepSeekClient:
             "stream": False,  # non-streaming path — never leave stream unset
         }
         if _REMOTE_MAX_CONTEXT > 0:
-            # Opt-in only (EVSMEM_MAX_CONTEXT set): gateways that reject
-            # unknown fields would 400 the request otherwise.
+            # Default 265000 (user-approved window): the zen endpoint accepts
+            # the field (verified live), so the batch can actually use the
+            # whole window instead of silently truncating at a tiny default.
             payload["max_context_tokens"] = _REMOTE_MAX_CONTEXT
+        if _REMOTE_REASONING_EFFORT:
+            # Minimum thinking effort this model supports (low/high/max); no
+            # off/none level exists on zen for deepseek-v4-flash-free yet.
+            payload["reasoning_effort"] = _REMOTE_REASONING_EFFORT
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice

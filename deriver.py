@@ -730,7 +730,13 @@ class Deriver:
             return None, _empty_tool_stats()
 
         context = self._build_memory_context(workspace_id)
-        batch_cap = int(os.getenv("EVSMEM_BATCH_MAX_CHARS", "24000"))
+        # The batch must fit INSIDE the remote context window (EVSMEM_MAX_CONTEXT,
+        # default 265000 tokens). ~3.6 chars/token for mixed memory text → a
+        # ~750K-char cap keeps the whole batch under the window even with the
+        # system context + preamble + output headroom. The old 24000-char
+        # default truncated ~300 memories down to a few thousand tokens, which
+        # is why the LLM never saw the later rows.
+        batch_cap = int(os.getenv("EVSMEM_BATCH_MAX_CHARS", "750000"))
         truncated = content if len(content) <= batch_cap else content[:batch_cap] + "\n...[truncated]"
         user_prompt = (
             LLM_BATCH_PREAMBLE.format(count=len(msgs))
@@ -753,7 +759,14 @@ class Deriver:
         """
         tool_stats = _empty_tool_stats()
         gen = getattr(llm, "generate_with_tools", None)
-        max_tokens = 4096 if engine == "remote" else 2048
+        # Remote output budget: the batch JSON (up to BATCH_MAX_MSGS rows with
+        # behaviours/hot/cold/merged) needs far more than the old hardcoded
+        # 4096, which truncated the reply so only ~2-6 rows ever landed.
+        # Default 32768, env-configurable. Local GGUF stays small (2K).
+        max_tokens = (
+            int(os.getenv("EVSMEM_BATCH_MAX_TOKENS", "32768"))
+            if engine == "remote" else 2048
+        )
 
         if gen is None:
             # Plain chat completion (local GGUF fallback): ask for the JSON
