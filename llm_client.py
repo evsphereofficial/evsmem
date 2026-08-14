@@ -76,8 +76,8 @@ _MODEL_PATH = os.getenv(
     "LLM_MODEL_PATH",
     str(Path(__file__).resolve().parent / "models" / "gemma-4-12B-it-QAT-GGUF" / "gemma-4-12B-it-QAT-Q4_0.gguf"),
 )
-_N_CTX = int(os.getenv("LLM_N_CTX", "4096"))
-_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+_N_CTX = int(os.getenv("LLM_N_CTX", "264000"))
+_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "64000"))
 _GPU_LAYERS = int(os.getenv("LLM_GPU_LAYERS", "-1"))
 
 # Add CUDA DLL directory so llama_cpp can find them at import time.
@@ -108,6 +108,19 @@ _MAX_RETRIES = int(os.getenv("EVSMEM_LLM_MAX_RETRIES", "3"))
 _RETRY_BASE_DELAY = float(os.getenv("EVSMEM_LLM_RETRY_BASE", "1.0"))
 _RETRY_MAX_DELAY = float(os.getenv("EVSMEM_LLM_RETRY_MAX", "16.0"))
 _RETRY_JITTER = float(os.getenv("EVSMEM_LLM_RETRY_JITTER", "0.3"))
+
+# Generation-size defaults for the REMOTE provider (the local GGUF client has
+# its own GPU-safety defaults above). EVSMEM_MAX_TOKENS caps the remote
+# model's OUTPUT — the deriver's batch JSON (dozens of rows across 300
+# messages) used to be truncated at a hardcoded 4096, which is why only 2-6
+# short rows ever landed. Default 16384, env-configurable (the user's old
+# LLM_MAX_TOKENS=64000 never reached the remote payload — it was dead code).
+_REMOTE_MAX_TOKENS = int(os.getenv("EVSMEM_MAX_TOKENS", "16384"))
+# OPT-IN context cap: most OpenAI-compatible servers reject unknown request
+# fields, so `max_context_tokens` is only sent when EVSMEM_MAX_CONTEXT is
+# explicitly set (> 0). Default 0 = not sent (the model's native context
+# applies, e.g. 265K for the zen/DeepSeek endpoint).
+_REMOTE_MAX_CONTEXT = int(os.getenv("EVSMEM_MAX_CONTEXT", "0"))
 
 # HTTP statuses considered transient (retried with backoff).
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -300,8 +313,14 @@ class DeepSeekClient:
             return ""
 
     def _chat(self, messages, tools=None, tool_choice="auto",
-              max_tokens=512, temperature=0.1) -> dict:
-        """One chat/completions round against the zen endpoint."""
+              max_tokens: int | None = None, temperature=0.1) -> dict:
+        """One chat/completions round against the zen endpoint.
+
+        ``max_tokens=None`` resolves to ``EVSMEM_MAX_TOKENS`` (default 16384)
+        so callers that don't care about output size always get the large
+        default — a truncated JSON reply is worse than a slightly bigger one.
+        """
+        max_tokens = max_tokens if max_tokens is not None else _REMOTE_MAX_TOKENS
         headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {
             "model": self._model,
@@ -310,6 +329,10 @@ class DeepSeekClient:
             "temperature": temperature,
             "stream": False,  # non-streaming path — never leave stream unset
         }
+        if _REMOTE_MAX_CONTEXT > 0:
+            # Opt-in only (EVSMEM_MAX_CONTEXT set): gateways that reject
+            # unknown fields would 400 the request otherwise.
+            payload["max_context_tokens"] = _REMOTE_MAX_CONTEXT
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
@@ -319,10 +342,14 @@ class DeepSeekClient:
             timeout=self._timeout, max_retries=self._max_retries,
         )
 
-    def generate(self, messages: list[dict], max_tokens: int = 512,
+    def generate(self, messages: list[dict], max_tokens: int | None = None,
                  temperature: float = 0.1) -> str:
         """Generate a text reply; falls back to the local GGUF model on ANY
-        remote failure (or when the API key is unset)."""
+        remote failure (or when the API key is unset).
+
+        ``max_tokens=None`` → ``EVSMEM_MAX_TOKENS`` (default 16384).
+        """
+        max_tokens = max_tokens if max_tokens is not None else _REMOTE_MAX_TOKENS
         if not self.is_available():
             return self._local_generate(messages, max_tokens, temperature)
         try:
