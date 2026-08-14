@@ -9,7 +9,10 @@ import uvicorn
 from main import app
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=9876)
+    host = os.getenv("EVSMEM_HOST", "127.0.0.1")
+    port = int(os.getenv("EVSMEM_PORT", "9876"))
+    log_level = os.getenv("EVSMEM_LOG_LEVEL", "info")
+    uvicorn.run(app, host=host, port=port, log_level=log_level)
 
 if __name__ == "__main__":
     main()

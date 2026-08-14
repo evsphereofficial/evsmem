@@ -39,8 +39,27 @@ if not logger.handlers:
 
 DB_PATH = Path.home() / ".evsmem" / "evsmem.db"
 
-# Ev-agent session DB path
-EV_SESSION_DB = Path.home() / ".local" / "share" / "ev-agent" / "ev-agent-local.db"
+# Ev-agent session DB path. The packaged binary (channel latest/beta/prod)
+# writes "ev-agent.db", while a local/dev install writes
+# "ev-agent-local.db" (channel "local"). Resolve the file that actually
+# exists, preferring dev DBs then the generic one.
+_EV_AGENT_DATA = Path.home() / ".local" / "share" / "ev-agent"
+
+
+def _resolve_session_db() -> Path:
+    env = os.getenv("EV_SESSION_DB")
+    if env:
+        p = Path(env).expanduser()
+        if p.exists():
+            return p
+    for name in ("ev-agent-local.db", "ev-agent.db"):
+        p = _EV_AGENT_DATA / name
+        if p.exists():
+            return p
+    return _EV_AGENT_DATA / "ev-agent-local.db"
+
+
+EV_SESSION_DB = _resolve_session_db()
 
 # Legacy 5s poll interval — kept for backward compatibility, no longer used by
 # the scheduler (see EVSMEM_DERIVE_INTERVAL below).

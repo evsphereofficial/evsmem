@@ -14,3 +14,7 @@ dependencies = [
 
 [project.scripts]
 evsmem = "evsmem.__main__:main"
+
+[tool.setuptools]
+packages = ["evsmem"]
+package-dir = { evsmem = "." }
