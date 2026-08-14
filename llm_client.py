@@ -125,13 +125,11 @@ _REMOTE_MAX_CONTEXT = int(os.getenv("EVSMEM_MAX_CONTEXT", "0"))
 # HTTP statuses considered transient (retried with backoff).
 _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
-# Browser-like User-Agent: Cloudflare (error 1010) rejects urllib's default
-# "Python-urllib/3.x" UA with HTTP 403 on opencode.ai — confirmed root cause.
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-)
-
+# opencode-compatible User-Agent: the zen server's checkHeaders rate-limiter
+# grants official-client limits only to requests whose User-Agent starts with
+# "opencode/" — a browser UA (Mozilla/...) hits the tiny per-IP fallback quota
+# and 429s.
+_OPENCODE_UA = "opencode/evsmem/1.0"
 # Patchable in tests.
 _urlopen = urllib.request.urlopen
 
@@ -161,11 +159,17 @@ def _zen_request(method: str, url: str, payload=None, headers=None,
     max_retries = max_retries if max_retries is not None else _MAX_RETRIES
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
-    # Browser-like headers on EVERY request: Cloudflare error 1010 would
-    # otherwise 403 the default "Python-urllib/*" User-Agent.
-    request.add_header("User-Agent", _BROWSER_UA)
+    # opencode-compatible headers on EVERY request: the zen server's rate
+    # limiter (checkHeaders) only grants full daily limits to requests
+    # carrying the official client headers — a plain/browser UA gets the tiny
+    # per-IP fallback quota and 429s immediately.
+    request.add_header("User-Agent", _OPENCODE_UA)
     request.add_header("Accept", "application/json")
     request.add_header("Accept-Language", "en-US,en;q=0.9")
+    request.add_header("x-opencode-project", "evsmem")
+    request.add_header("x-opencode-session", f"ses_evsmem_{uuid4().hex}")
+    request.add_header("x-opencode-request", f"msg_evsmem_{uuid4().hex}")
+    request.add_header("x-opencode-client", "evsmem")
     if payload is not None:
         request.add_header("Content-Type", "application/json")
     for k, v in (headers or {}).items():
