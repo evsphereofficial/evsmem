@@ -52,10 +52,17 @@ def _resolve_session_db() -> Path:
         p = Path(env).expanduser()
         if p.exists():
             return p
-    for name in ("ev-agent-local.db", "ev-agent.db"):
-        p = _EV_AGENT_DATA / name
-        if p.exists():
-            return p
+    # Prefer the most-recently-modified existing DB: newer ev-agent builds
+    # write "ev-agent-main.db" while legacy installs still touch
+    # "ev-agent.db"/"ev-agent-local.db", and only the file that is actually
+    # being written contains the live conversation to sync.
+    candidates = [
+        _EV_AGENT_DATA / name
+        for name in ("ev-agent-main.db", "ev-agent-local.db", "ev-agent.db")
+    ]
+    existing = [p for p in candidates if p.exists()]
+    if existing:
+        return max(existing, key=lambda p: p.stat().st_mtime)
     return _EV_AGENT_DATA / "ev-agent-local.db"
 
 
@@ -451,6 +458,13 @@ class Deriver:
                     meta = json.loads(r["metadata"] or "{}")
                 except Exception:
                     pass
+                # Internal subagent chatter is NOT the human user's conversation.
+                # Exclude it from memory extraction entirely (it stays synced and
+                # searchable; the analysis cursor advances past it, so it is never
+                # re-processed). Without this, batches can be ~90% subagent noise
+                # that dilutes the extraction the LLM can produce.
+                if bool(meta.get("is_subagent", False)):
+                    continue
                 out.append({
                     "rowid": r["rowid"],
                     "id": r["id"],
@@ -458,7 +472,7 @@ class Deriver:
                     "role": r["role"],
                     "session_id": r["session_id"],
                     "workspace_id": r["workspace_id"],
-                    "is_subagent": bool(meta.get("is_subagent", False)),
+                    "is_subagent": False,
                     "created_at": r["created_at"],
                 })
                 if len(out) >= max_msgs:
@@ -543,6 +557,26 @@ class Deriver:
             newest = now
         return newest.isoformat()
 
+    def _oldest_unprocessed_ts(self) -> Optional[str]:
+        """Timestamp of the OLDEST unprocessed message with content, used to
+        rewind the analysis cursor after the mirror was rebuilt/reset so old
+        synced messages are not skipped forever. Returns None when there is
+        nothing unprocessed."""
+        conn = get_db()
+        try:
+            row = conn.execute(
+                """SELECT created_at FROM messages
+                   WHERE is_processed = 0 AND content != ''
+                   ORDER BY rowid ASC LIMIT 1"""
+            ).fetchone()
+            if row and row["created_at"]:
+                ts = _parse_db_ts(row["created_at"])
+                if ts is not None:
+                    return ts.isoformat()
+            return None
+        finally:
+            conn.close()
+
     # ── LLM Processing Pipeline ──
 
     def _get_llm(self):
@@ -617,7 +651,21 @@ class Deriver:
         total = sum(len(v) for v in batches.values())
         stats["messages_processed"] = total
         if total == 0:
-            # Nothing new; roll the window forward so it doesn't grow unbounded.
+            # Nothing new in the rolling window. BUT: if unprocessed messages
+            # exist that are OLDER than the cursor (e.g. the mirror was rebuilt
+            # by resync_messages.py, or the DB file was swapped, leaving
+            # messages behind the last_analysis_at cursor), rewinding the
+            # cursor to the OLDEST unprocessed message ensures they get
+            # analyzed in subsequent passes instead of being skipped forever.
+            older = self._oldest_unprocessed_ts()
+            if older is not None:
+                logger.info(
+                    f"Batch empty but {older} unprocessed message(s) predate the "
+                    "cursor — rewinding window to catch up"
+                )
+                self._advance_analysis_cursor(at=older)
+                return False  # do not advance the window yet; retry next pass
+            # Otherwise roll the window forward so it doesn't grow unbounded.
             self._advance_analysis_cursor()
             return True
 
@@ -1471,6 +1519,7 @@ class Deriver:
                     (row["id"],),
                 ).fetchall()
                 text_parts = []
+                tool_names = []
                 for p in parts:
                     try:
                         pd = json.loads(p["data"]) if isinstance(p["data"], str) else (p["data"] or {})
@@ -1480,7 +1529,17 @@ class Deriver:
                         text = (pd.get("text") or "").strip()
                         if text and len(text) > 2:
                             text_parts.append(text[:2000])
+                    elif pd.get("type") == "tool" and pd.get("tool"):
+                        # Tool-call parts are dropped from the synced text so they
+                        # don't bloat it, but the TOOL NAMES are appended as a
+                        # compact marker — otherwise the deriver has no idea which
+                        # tools were used (tool_usage extraction was always empty).
+                        name = str(pd["tool"])
+                        if name not in tool_names:
+                            tool_names.append(name)
                 content = " | ".join(text_parts[:5]) if text_parts else str(data.get("summary", ""))[:500]
+                if tool_names:
+                    content += "\n[TOOLS USED: " + ", ".join(tool_names[:8]) + "]"
 
                 # A message is "settled" once it is old enough that streaming is
                 # guaranteed done. Everything is stored INSTANTLY, but the sync
