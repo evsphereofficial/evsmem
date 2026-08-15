@@ -34,6 +34,14 @@ if os.path.isdir(_cuda_dll_dir):
 _model = None
 _MODEL_LOCK = threading.Lock()
 
+# llama.cpp contexts are NOT thread-safe: the API event loop and the deriver
+# background thread both call create_embedding() on the same Llama singleton.
+# Concurrent decodes corrupt the compute graph (GGML_ASSERT
+# "cgraph->nodes[cgraph->n_nodes - 1] == tensor" → abort(), which kills the
+# whole process and drops every in-flight HTTP request). Every embedding call
+# must be serialized.
+_EMBED_LOCK = threading.Lock()
+
 
 def _load_model():
     """Load BGE-M3 GGUF once (GPU if available). Stays in memory."""
@@ -80,7 +88,8 @@ class EmbeddingClient:
         logger.info(f"Embedding: {len(text)} chars")
         if _model is not None:
             try:
-                result = _model.create_embedding(text[:12000])
+                with _EMBED_LOCK:
+                    result = _model.create_embedding(text[:12000])
                 return result["data"][0]["embedding"]
             except Exception as e:
                 logger.warning(f"Embedding failed: {e}")
@@ -97,10 +106,11 @@ class EmbeddingClient:
         self._ensure_model()
         if _model is not None:
             try:
-                return [
-                    _model.create_embedding(t[:12000])["data"][0]["embedding"]
-                    for t in texts
-                ]
+                with _EMBED_LOCK:
+                    return [
+                        _model.create_embedding(t[:12000])["data"][0]["embedding"]
+                        for t in texts
+                    ]
             except Exception as e:
                 logger.warning(f"Batch embedding failed: {e}")
         import requests
