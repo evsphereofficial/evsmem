@@ -831,7 +831,7 @@ class Deriver:
         # 4096, which truncated the reply so only ~2-6 rows ever landed.
         # Default 32768, env-configurable. Local GGUF stays small (2K).
         max_tokens = (
-            int(os.getenv("EVSMEM_BATCH_MAX_TOKENS", "32768"))
+            int(os.getenv("EVSMEM_BATCH_MAX_TOKENS", "16192"))
             if engine == "remote" else 2048
         )
 
